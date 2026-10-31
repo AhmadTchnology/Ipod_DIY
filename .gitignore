@@ -1,0 +1,22 @@
+# PlatformIO / build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+!.vscode/extensions.json
+
+# Build & flash logs
+build_log.txt
+flash_log.txt
+fl_log.txt
+*.log
+
+# Firmware binaries (large, reproducible)
+*.bin
+*.elf
+*.map
+*.hex
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
