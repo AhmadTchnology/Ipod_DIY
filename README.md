@@ -1,6 +1,6 @@
 # MyPod — an iPod-style music player for the ESP32 "Cheap Yellow Display"
 
-MyPod turns the **ESP32-2432S028R** (a.k.a. CYD / "Cheap Yellow Display") into a
+MyPod turns the **ESP32-2432S028** (a.k.a. CYD / "Cheap Yellow Display") into a
 standalone, pocket-sized MP3 player:
 
 - Music from a microSD card plays over **Bluetooth headphones / speakers**
@@ -32,7 +32,7 @@ Bluetooth earphones.
 
 | Part | Detail |
 |---|---|
-| Board | ESP32-2432S028R 2-USB version (2.8", ILI9341-family panel, XPT2046 touch) |
+| Board | ESP32-2432S028 2-USB version (2.8", ILI9341-family panel, XPT2046 touch) |
 | Display | ILI9341-class driver over HSPI, 40 MHz, portrait 240x320 |
 | Touch | XPT2046 bit-banged: CLK 25, MOSI 32, MISO 39, CS 33, IRQ 36 |
 | SD card | VSPI: SCK 18, MISO 19, MOSI 23, CS 5 — FAT32 |
