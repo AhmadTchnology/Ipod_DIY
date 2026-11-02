@@ -36,7 +36,7 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t lastMs = millis();
+  static uint32_t lastMs = 0;               // trivial init — no C++ guard machinery
   uint32_t now = millis();
   lv_tick_inc(now - lastMs);
   lastMs = now;

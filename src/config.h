@@ -31,7 +31,7 @@
 #define MUSIC_DIR     "/music"
 #define MAX_TRACKS    800
 #define PATH_MAX_LEN  128
-#define RING_BYTES    (16 * 1024)   // PCM buffer between decoder and Bluetooth
+#define RING_BYTES    (12 * 1024)   // PCM buffer between decoder and Bluetooth (a frame is ~4.6 KB; kept lean for the SD-card boot)
 
 // Optional: hard-code your headphones' Bluetooth name (otherwise pair in the UI)
 #define DEFAULT_BT_NAME ""

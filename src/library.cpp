@@ -7,8 +7,11 @@
 static SPIClass sdSpi(VSPI);
 static bool sdReady = false;
 
-static char* pool = nullptr;        // all paths, NUL separated
-static uint32_t* offs = nullptr;    // offsets into pool, sorted by file name
+static char* pool = nullptr;        // paths (relative to the scan root), NUL separated
+static uint16_t* offs = nullptr;    // offsets into pool, sorted by file name
+static const size_t POOL_MAX = 65000;   // keeps uint16 offsets valid
+static const char* rootPrefix = ""; // "" for a root scan, "/music" for MUSIC_DIR
+static size_t rootSkip = 1;         // bytes of f.path() to skip to get the rel path
 static int nTracks = 0;
 
 static int passCount;
@@ -43,9 +46,10 @@ static void scanDir(const char* path, int depth) {
           continue;
         }
       } else if (isMp3(nm)) {
-        const char* p = f.path();
+        const char* p = f.path() + rootSkip;   // store path relative to the scan root
         size_t L = strlen(p) + 1;
-        if (L <= PATH_MAX_LEN && passCount < MAX_TRACKS) {
+        if (L <= PATH_MAX_LEN && passCount < MAX_TRACKS &&
+            passBytes + L <= POOL_MAX) {
           if (filling) {
             memcpy(pool + fillPos, p, L);
             offs[fillN++] = fillPos;
@@ -62,8 +66,15 @@ static void scanDir(const char* path, int depth) {
 }
 
 static void scanAll() {
-  if (SD.exists(MUSIC_DIR)) scanDir(MUSIC_DIR, 3);
-  else scanDir("/", 1);
+  if (SD.exists(MUSIC_DIR)) {
+    rootPrefix = MUSIC_DIR;
+    rootSkip = strlen(MUSIC_DIR) + 1;      // "/music/" -> skip it too
+    scanDir(MUSIC_DIR, 3);
+  } else {
+    rootPrefix = "";
+    rootSkip = 1;                          // "/" -> skip the leading slash
+    scanDir("/", 1);
+  }
 }
 
 void Library::rescan() {
@@ -74,12 +85,12 @@ void Library::rescan() {
   scanAll();
   if (passCount == 0) return;
   pool = (char*)malloc(passBytes);
-  offs = (uint32_t*)malloc(passCount * sizeof(uint32_t));
+  offs = (uint16_t*)malloc(passCount * sizeof(uint16_t));
   if (!pool || !offs) { free(pool); free(offs); pool = nullptr; offs = nullptr; return; }
   filling = true; fillPos = 0; fillN = 0; passCount = 0; passBytes = 0;
   scanAll();
   nTracks = fillN;
-  std::sort(offs, offs + nTracks, [](uint32_t a, uint32_t b) {
+  std::sort(offs, offs + nTracks, [](uint16_t a, uint16_t b) {
     return strcasecmp(baseName(pool + a), baseName(pool + b)) < 0;
   });
   Serial.printf("Library: %d tracks\n", nTracks);
@@ -94,7 +105,12 @@ void Library::begin() {
 
 bool Library::sdOk() { return sdReady; }
 int Library::count() { return nTracks; }
-const char* Library::path(int i) { return (i >= 0 && i < nTracks) ? pool + offs[i] : ""; }
+const char* Library::path(int i) {
+  if (i < 0 || i >= nTracks) return "";
+  static char buf[PATH_MAX_LEN];           // pool stores paths relative to root
+  snprintf(buf, PATH_MAX_LEN, "%s/%s", rootPrefix, pool + offs[i]);
+  return buf;
+}
 
 static void asciiCopy(const char* s, size_t len, char* out, size_t n) {
   size_t o = 0;

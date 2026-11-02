@@ -335,7 +335,7 @@ void begin() {
   cmdQ = xQueueCreate(1, sizeof(Cmd));
   mp3 = new MP3DecoderHelix(pcmCb);
   applyVolume();
-  xTaskCreatePinnedToCore(decodeTask, "mp3dec", 7168, nullptr, 3, nullptr, 0);
+  xTaskCreatePinnedToCore(decodeTask, "mp3dec", 6144, nullptr, 3, nullptr, 0);
 
   // this app only uses classic BT (A2DP); release the BLE pools (~10 KB)
   // that the BT connect below would otherwise starve on

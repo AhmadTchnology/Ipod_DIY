@@ -178,10 +178,12 @@ when LVGL and Bluetooth don't. The `wifi` NVS flag decides which mode boots;
 both modes flip the flag and restart when switching.
 
 **RAM notes** (the ESP32 has 320 KB DRAM, and BT + TLS + LVGL all want it):
-draw buffers are 2 x 8 display rows, the BLE-only memory pools are released
+draw buffers are 2 x 4 display rows, the BLE-only memory pools are released
 at boot (`esp_bt_mem_release(ESP_BT_MODE_BLE)` — only classic BT/A2DP is
-used), and the decoder task runs on a 7 KB stack. Settings → System shows
-live heap; keep an eye on it if you add features.
+used), and the decoder task runs on a small stack. The SD library stores
+track paths relative to `/music` (plus 2-byte offsets) to keep the whole
+library table under ~3 KB. Settings → System shows live heap; keep an eye
+on it if you add features.
 
 ## Troubleshooting
 

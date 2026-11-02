@@ -18,9 +18,9 @@ static int curPct = 0;
 static float ldrAvg = -1;
 
 static lv_disp_draw_buf_t drawBuf;
-static lv_color_t buf1[SCR_W * 8];   // 2x8-row draw buffers (halved from 16 rows
-static lv_color_t buf2[SCR_W * 8];   // to free RAM for Bluetooth — receiver mode
-static lv_disp_drv_t dispDrv;        // statically costs ~12 KB, causing OOM)
+static lv_color_t buf1[SCR_W * 4];   // 2x4-row draw buffers (steps: 16 -> 8 -> 6
+static lv_color_t buf2[SCR_W * 4];   // -> 4 rows, reclaiming RAM for the Bluetooth
+static lv_disp_drv_t dispDrv;        // stack — see README troubleshooting)
 static lv_indev_drv_t indevDrv;
 static lv_disp_t* disp = nullptr;
 
