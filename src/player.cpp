@@ -69,7 +69,9 @@ static BluetoothA2DPSource a2dp;
 
 static volatile bool g_paused = true;      // user pause (or nothing playing)
 static volatile bool g_loaded = false;     // a track is open
-static volatile bool g_switching = false;  // open/seek in flight -> output silence
+static volatile bool g_switching = false;
+static volatile bool btPulling = false;     // a2dpData has pulled at least once
+static uint32_t g_openMs = 0;               // when the current file was opened  // open/seek in flight -> output silence
 static volatile bool g_eof = false;        // decoder read the whole file
 static volatile bool g_fail = false;       // could not open file
 static volatile uint32_t g_gen = 0;        // bumped on every command (aborts blocking writes)
@@ -198,7 +200,9 @@ static uint32_t id3Parse(File& f) {
 static void doSeek(File& f, float frac) {
   uint32_t pos = g_aStart + (uint32_t)(frac * (float)(g_aEnd - g_aStart));
   f.seek(pos);
-  mp3->end(); mp3->begin();
+  // no mp3->end()/begin() here: re-allocating helix's buffers after
+  // Bluetooth has fragmented the heap fails and kills the decoder task.
+  // The decoder re-syncs on the next sync word by itself.
   resetResampler();
   ring.flush();
   g_base = g_dur ? frac * g_dur : 0;
@@ -225,14 +229,17 @@ static void decodeTask(void*) {
       decGen = g_gen;
       if (c.type == CMD_STOP) {
         if (f) f.close();
-        mp3->end();
         ring.flush();
         open = false; g_loaded = false; g_eof = false; g_switching = false;
         continue;
       }
       if (c.type == CMD_OPEN) {
+        if (!*mp3) {                 // helix buffers never allocated: fail soft
+          g_fail = true; g_eof = true; g_loaded = true; g_switching = false;
+          g_serial++;
+          continue;
+        }
         if (f) f.close();
-        mp3->end();
         ring.flush();
         resetResampler();
         g_frames = 0; g_base = 0; g_dur = 0; g_eof = false; g_fail = false;
@@ -249,7 +256,7 @@ static void decodeTask(void*) {
         if (g_aStart >= g_aEnd) g_aStart = 0;
         f.seek(g_aStart);
         Library::sdExit();
-        mp3->begin();
+        g_openMs = millis();
         open = true; g_loaded = true; g_switching = false;
         g_serial++;
         continue;
@@ -265,6 +272,15 @@ static void decodeTask(void*) {
       continue;
     }
     if (!open || g_eof) continue;
+
+    // don't decode ahead of the Bluetooth link: until the stack starts
+    // pulling PCM, the ring would overflow and decoded audio would be
+    // skipped. Wait for the first pull (or give up after 12 s so a pod
+    // with no speaker still advances the track).
+    if (!btPulling) {
+      if (millis() - g_openMs > 12000) btPulling = true;
+      else { vTaskDelay(pdMS_TO_TICKS(60)); continue; }
+    }
 
     Library::sdEnter();                      // file reads share the bus with the UI's index lookups
     int n = f.read(buf, sizeof(buf));
@@ -282,6 +298,7 @@ static void decodeTask(void*) {
 
 // ---------------------------------------------------------------- Bluetooth side
 static int32_t a2dpData(Frame* out, int32_t frames) {
+  btPulling = true;                          // the BT stack is pulling: decode may run
   size_t need = (size_t)frames * 4;
   if (g_paused || !g_loaded || g_switching) {
     memset(out, 0, need);                        // keep the link alive with silence
@@ -345,39 +362,57 @@ static int randomOther() {
   return r;
 }
 
+void prealloc() {
+  // allocate helix's decoder buffers before anything else touches the heap.
+  // Bluetooth needs ~88 KB when it starts and afterwards fragments the heap
+  // so the largest block never fits helix's buffers again (play then wedged
+  // the decoder task). At boot there is plenty for both. The buffers are
+  // NEVER freed — they stay pinned so later allocations flow around them.
+  mp3 = new MP3DecoderHelix(pcmCb);
+  mp3->setMaxFrameSize(1536);            // biggest MP3 frame is 1441 bytes
+  mp3->setMaxPCMSize(4608);              // 1152 samples x 2ch x 2 bytes
+  if (!mp3->begin()) Serial.println("[dec] helix alloc FAILED!");
+  Serial.printf("[dec] helix buffers pinned, heap=%u\n",
+                (unsigned)ESP.getFreeHeap());
+}
+
 void begin() {
   if (!ring.init(RING_BYTES)) Serial.println("PCM ring alloc failed!");
   cmdQ = xQueueCreate(1, sizeof(Cmd));
-  mp3 = new MP3DecoderHelix(pcmCb);
   applyVolume();
-  xTaskCreatePinnedToCore(decodeTask, "mp3dec", 5376, nullptr, 3, nullptr, 0);
+  xTaskCreatePinnedToCore(decodeTask, "mp3dec", 3072, nullptr, 3, nullptr, 0);
+}
 
+// Bluetooth starts on the FIRST PLAY, not at boot: the stack permanently
+// holds ~88 KB and its connect step needs ~105+ KB free to survive. At boot
+// the decoder's pinned buffers + the UI leave too little; by play time the
+// order is: BT first (plenty of headroom), then the SD card.
+static bool btUp = false;
+void ensureBt() {
+  if (btUp) return;
+  btUp = true;
   // this app only uses classic BT (A2DP); release the BLE pools (~10 KB)
-  // that the BT connect below would otherwise starve on
   esp_bt_mem_release(ESP_BT_MODE_BLE);
   Serial.printf("[heap] before a2dp: %u\n", (unsigned)ESP.getFreeHeap());
-
-  g_scan = S.pairNext || !S.btName[0];
-  a2dp.set_auto_reconnect(true);
-  a2dp.set_data_callback_in_frames(a2dpData);
-
-  // heap gate: the A2DP connect crashes the stack when system RAM is nearly
-  // empty (receiver mode's WiFi/TLS statics live in the same image). Wait a
-  // little for SD scanning to settle, then go anyway if it never rises.
   int h = (int)ESP.getFreeHeap();
   for (int tries = 0; h < 24000 && tries < 60; tries++) {
     vTaskDelay(pdMS_TO_TICKS(250));
     h = (int)ESP.getFreeHeap();
   }
   Serial.printf("[heap] a2dp.start with %u\n", (unsigned)h);
-
+  g_scan = S.pairNext || !S.btName[0];
+  a2dp.set_auto_reconnect(true);
+  a2dp.set_data_callback_in_frames(a2dpData);
   if (g_scan) {
     a2dp.set_ssid_callback(onFound);
     a2dp.start();
   } else {
     a2dp.start(S.btName);
   }
+  Serial.printf("[heap] after a2dp.start: %u\n", (unsigned)ESP.getFreeHeap());
 }
+
+bool btStarted() { return btUp; }
 
 void play(int idx) { startTrack(idx, true); }
 

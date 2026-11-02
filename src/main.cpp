@@ -16,18 +16,13 @@ void setup() {
   Hal::earlyInit();                         // backlight, TFT, splash
   if (Receiver::enabled()) Receiver::run(); // WiFi receiver mode, never returns
   Serial.printf("[heap] after early: %u\n", (unsigned)ESP.getFreeHeap());
+  Player::prealloc();                       // pin helix buffers before anything else
+  Player::begin();                          // PCM ring + decoder task (Bluetooth waits for play)
   Touch::begin();
   pinMode(PIN_BOOT, INPUT_PULLUP);
   if (!Touch::loadCal() || digitalRead(PIN_BOOT) == LOW) Touch::calibrate(Hal::tft);
-  Library::begin();                         // SD + scan
-  Serial.printf("[heap] after library: %u\n", (unsigned)ESP.getFreeHeap());
-  Player::begin();                          // decoder task + Bluetooth (allocate before LVGL grows)
-  if (S.btName[0] && !S.pairNext) {
-    // a saved device triggers the BT stack's async connect allocations; give
-    // them time to land before LVGL/UI consumes the remaining heap
-    delay(2500);
-    Serial.printf("[heap] after BT settle: %u\n", (unsigned)ESP.getFreeHeap());
-  }
+  // the SD card and Bluetooth come up lazily on first play / library view:
+  // the A2DP connect step needs ~105+ KB free and only exists there
   Hal::lvglInit();
   Serial.printf("[heap] after lvgl: %u\n", (unsigned)ESP.getFreeHeap());
   UI::build();

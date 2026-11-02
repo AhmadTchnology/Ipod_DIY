@@ -11,33 +11,39 @@
 
 // ------------------------------------------------------------------ palette
 // Colours come from the theme module (saved look + accent, see Settings).
-// C_BG/C_TEXT swap automatically when the Light look is chosen.
+// The iPod look = Dark look + a green accent (pick it in Settings -> Theme).
 #define C_BG    Th_bg
 #define C_SURF  Th_surf
 #define C_SURF2 Th_sur2
 #define C_TEXT  Th_text
 #define C_DIM   Th_dim
 #define C_ACC   Th_acc
-// fixed companions: Bluetooth-connect blue and the album-art gradient end
+// fixed companions
 #define C_BLUE  lv_color_hex(0x0A84FF)
-#define C_PURP  lv_color_hex(0x5E5CE6)
+#define C_PIX   &lv_font_unscii_16      // the chunky pixel font (iPod look)
 
 #define ROW_H  46
 #define POOL   8
-#define HDR_H  40
-#define TAB_H  46
+
+// pages
+enum { PAGE_LIB = 0, PAGE_NOW = 1, PAGE_SET = 2 };
+static void showPage(int p);                    // defined at the bottom
+static int curPage = -1;
+static int prevPage = PAGE_NOW;
+static lv_obj_t* pageObj = nullptr;
 
 // ------------------------------------------------------------------ state
 struct Row { lv_obj_t *obj, *title, *sub, *icon; int idx; };
 
 static bool uiActive = true;
-static lv_obj_t *tv, *tabLib, *tabNow, *tabSet;
 // library
-static lv_obj_t *libCont, *libSpacer, *libCount, *libEmpty;
+static lv_obj_t *tabLib, *libCont, *libSpacer, *libCount, *libEmpty;
 static Row rows[POOL];
+// now playing / settings page roots (lazy-built)
+static lv_obj_t *tabNow = nullptr, *tabSet = nullptr;
 // now playing
-static lv_obj_t *npArt, *npTitle, *npArtist, *npSeek, *npEl, *npRem, *npBt, *npCnt;
-static lv_obj_t *npPlay, *npPlayLbl, *npShuf, *npShufLbl, *npRep, *npRepLbl, *npVol;
+static lv_obj_t *npArt, *npTitle, *npArtist, *npSeek, *npEl, *npRem, *npBt;
+static lv_obj_t *npPlay, *npPlayLbl, *npShufLbl, *npVol;
 // settings
 static lv_obj_t *setBtLbl, *setInfo, *lblBright, *lblLimit;
 // picker overlay
@@ -45,23 +51,16 @@ static lv_obj_t *pickPanel = nullptr, *pickList = nullptr;
 static int pickShown = -1;
 
 static lv_style_t stBtn, stBtnPress, stRow, stRowPress;
-static lv_style_transition_dsc_t trDsc;
-static const lv_style_prop_t trProps[] = {
-  LV_STYLE_TRANSFORM_WIDTH, LV_STYLE_TRANSFORM_HEIGHT, LV_STYLE_BG_COLOR, LV_STYLE_BG_OPA, LV_STYLE_PROP_INV
-};
 
 static lv_anim_enable_t animFlag() { return S.animations ? LV_ANIM_ON : LV_ANIM_OFF; }
 
 // ------------------------------------------------------------------ helpers
 static void initStyles() {
-  lv_style_transition_dsc_init(&trDsc, trProps, lv_anim_path_ease_out, 140, 0, NULL);
   lv_style_init(&stBtn);
-  lv_style_set_transition(&stBtn, &trDsc);
   lv_style_init(&stBtnPress);
-  lv_style_set_transform_width(&stBtnPress, -5);
-  lv_style_set_transform_height(&stBtnPress, -5);
+  lv_style_set_transform_width(&stBtnPress, -4);
+  lv_style_set_transform_height(&stBtnPress, -4);
   lv_style_init(&stRow);
-  lv_style_set_transition(&stRow, &trDsc);
   lv_style_set_border_side(&stRow, LV_BORDER_SIDE_BOTTOM);
   lv_style_set_border_width(&stRow, 1);
   lv_style_set_border_color(&stRow, C_SURF2);
@@ -85,7 +84,6 @@ static lv_obj_t* mkBtn(lv_obj_t* p, const char* sym, const lv_font_t* f, int w, 
   lv_obj_set_size(b, w, h);
   lv_obj_add_style(b, &stBtn, 0);
   lv_obj_add_style(b, &stBtnPress, LV_STATE_PRESSED);
-  lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
   lv_obj_t* l = mkLabel(b, sym, f, fg);
   lv_obj_center(l);
   lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
@@ -119,13 +117,14 @@ static void breatheExec(void* o, int32_t v) {
   lv_obj_set_style_transform_height((lv_obj_t*)o, v, 0);
 }
 static void setBreathing(bool on) {
+  if (curPage != PAGE_NOW || !npArt) return;   // npArt only exists on the Now page
   lv_anim_del(npArt, breatheExec);
   if (on && S.animations && uiActive) {
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, npArt);
     lv_anim_set_exec_cb(&a, breatheExec);
-    lv_anim_set_values(&a, 0, 6);
+    lv_anim_set_values(&a, 0, 5);
     lv_anim_set_time(&a, 1100);
     lv_anim_set_playback_time(&a, 1100);
     lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
@@ -137,11 +136,10 @@ static void setBreathing(bool on) {
 }
 
 static void applyAnimSetting() {
-  lv_obj_set_style_anim_time(lv_tabview_get_content(tv), S.animations ? 280 : 0, 0);
   setBreathing(Player::active());
 }
 
-// ------------------------------------------------------------------ library page (virtualised list)
+// ------------------------------------------------------------------ library page
 static void fillRow(Row& r, int idx) {
   r.idx = idx;
   char t[64], a[48];
@@ -178,15 +176,16 @@ static void cbRow(lv_event_t* e) {
   int slot = (int)(intptr_t)lv_event_get_user_data(e);
   int idx = rows[slot].idx;
   if (idx < 0) return;
+  if (!Library::start()) return;               // lazy SD mount
+  Player::ensureBt();                          // lazy Bluetooth start (non-blocking)
   if (!(idx == Player::current() && Player::loaded())) Player::play(idx);
-  lv_tabview_set_act(tv, 1, animFlag());
+  showPage(PAGE_NOW);
 }
 
 void UI::refreshLibrary() {
+  if (curPage != PAGE_LIB) return;             // widgets only exist on the Library page
   int n = Library::count();
   lv_obj_set_size(libSpacer, 1, (n > 0 ? n : 1) * ROW_H);
-  // an empty spacer must not be scrollable: zero-height momentum scroll
-  // on a nearly empty container has crashed LVGL under memory pressure
   if (n > 0) lv_obj_add_flag(libCont, LV_OBJ_FLAG_SCROLLABLE);
   else lv_obj_clear_flag(libCont, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_scroll_to_y(libCont, 0, LV_ANIM_OFF);
@@ -204,15 +203,22 @@ void UI::refreshLibrary() {
 
 static void buildLibrary() {
   lv_obj_clear_flag(tabLib, LV_OBJ_FLAG_SCROLLABLE);
-  mkLabel(tabLib, "Library", &lv_font_montserrat_20, C_TEXT);
-  lv_obj_set_pos(lv_obj_get_child(tabLib, 0), 14, 8);
-  libCount = mkLabel(tabLib, "", &lv_font_montserrat_12, C_DIM);
-  lv_obj_align(libCount, LV_ALIGN_TOP_RIGHT, -14, 13);
+
+  lv_obj_t* back = mkBtn(tabLib, LV_SYMBOL_LEFT, &lv_font_montserrat_14, 26, 20, C_TEXT,
+                         [](lv_event_t*){ showPage(PAGE_NOW); });
+  lv_obj_set_pos(back, 2, 0);
+  mkLabel(tabLib, "Music", C_PIX, C_TEXT);
+  lv_obj_set_pos(lv_obj_get_child(tabLib, lv_obj_get_child_cnt(tabLib) - 1), 34, 1);
+  libCount = mkLabel(tabLib, "", C_PIX, C_DIM);
+  lv_obj_align(libCount, LV_ALIGN_TOP_RIGHT, -32, 1);
+  lv_obj_t* gear = mkBtn(tabLib, LV_SYMBOL_SETTINGS, &lv_font_montserrat_14, 26, 20, C_TEXT,
+                         [](lv_event_t*){ showPage(PAGE_SET); });
+  lv_obj_align(gear, LV_ALIGN_TOP_RIGHT, 0, 0);
 
   libCont = lv_obj_create(tabLib);
   lv_obj_remove_style_all(libCont);
-  lv_obj_set_pos(libCont, 0, HDR_H);
-  lv_obj_set_size(libCont, SCR_W, SCR_H - TAB_H - HDR_H);
+  lv_obj_set_pos(libCont, 0, 24);
+  lv_obj_set_size(libCont, SCR_W, SCR_H - 24);
   lv_obj_set_scroll_dir(libCont, LV_DIR_VER);
   lv_obj_set_scrollbar_mode(libCont, LV_SCROLLBAR_MODE_ACTIVE);
   lv_obj_add_flag(libCont, LV_OBJ_FLAG_SCROLL_MOMENTUM);
@@ -254,12 +260,15 @@ static void buildLibrary() {
 }
 
 // ------------------------------------------------------------------ now playing page
-static void cbPlay(lv_event_t*) { Player::toggle(); }
+static void cbPlay(lv_event_t*) {
+  if (!Library::start()) return;
+  Player::ensureBt();
+  Player::toggle();
+}
 static void cbNext(lv_event_t*) { Player::next(); }
 static void cbPrev(lv_event_t*) { Player::prev(); }
 static void cbShuf(lv_event_t*) { Player::setShuffle(!S.shuffle); }
-static void cbRep(lv_event_t*)  { Player::setRepeat((S.repeat + 1) % 3); }
-static void cbArt(lv_event_t*)  { Player::toggle(); }
+static void cbArt(lv_event_t*)  { cbPlay(nullptr); }
 
 static void cbSeek(lv_event_t* e) {
   lv_obj_t* s = lv_event_get_target(e);
@@ -272,108 +281,112 @@ static void cbVol(lv_event_t* e) {
   if (lv_slider_get_value(s) > S.volume) lv_slider_set_value(s, S.volume, LV_ANIM_OFF);  // volume limit
 }
 
-static void styleSlider(lv_obj_t* s, int h) {
-  lv_obj_set_height(s, h);
+// green bars on black, like the iPod's pause glyph
+static void styleBars(lv_obj_t* s) {
   lv_obj_set_style_bg_color(s, C_SURF2, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(s, C_TEXT, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_color(s, C_TEXT, LV_PART_KNOB);
-  lv_obj_set_style_pad_all(s, 3, LV_PART_KNOB);
-  lv_obj_set_ext_click_area(s, 14);
+  lv_obj_set_style_bg_opa(s, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(s, C_TEXT, LV_PART_MAIN);
+  lv_obj_set_style_border_width(s, 1, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(s, C_ACC, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(s, C_ACC, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(s, 2, LV_PART_KNOB);
+  lv_obj_set_ext_click_area(s, 12);
 }
 
 static void buildNowPlaying() {
   lv_obj_clear_flag(tabNow, LV_OBJ_FLAG_SCROLLABLE);
 
-  npBt = mkLabel(tabNow, "", &lv_font_montserrat_12, C_DIM);
-  lv_obj_set_pos(npBt, 12, 2);
-  npCnt = mkLabel(tabNow, "", &lv_font_montserrat_12, C_DIM);
-  lv_obj_align(npCnt, LV_ALIGN_TOP_RIGHT, -12, 2);
+  // top bar: back | MyPod | bt state | settings
+  lv_obj_t* back = mkBtn(tabNow, LV_SYMBOL_LEFT, &lv_font_montserrat_14, 26, 20, C_TEXT,
+                         [](lv_event_t*){ showPage(PAGE_LIB); });
+  lv_obj_set_pos(back, 2, 0);
+  mkLabel(tabNow, "MyPod", C_PIX, C_DIM);
+  lv_obj_set_pos(lv_obj_get_child(tabNow, lv_obj_get_child_cnt(tabNow) - 1), 34, 1);
+  npBt = mkLabel(tabNow, "", C_PIX, C_DIM);
+  lv_obj_align(npBt, LV_ALIGN_TOP_RIGHT, -32, 1);
+  lv_obj_t* gear = mkBtn(tabNow, LV_SYMBOL_SETTINGS, &lv_font_montserrat_14, 26, 20, C_TEXT,
+                         [](lv_event_t*){ showPage(PAGE_SET); });
+  lv_obj_align(gear, LV_ALIGN_TOP_RIGHT, 0, 0);
 
+  // album art frame (white border, like the reference)
   npArt = lv_obj_create(tabNow);
   lv_obj_remove_style_all(npArt);
-  lv_obj_set_size(npArt, 112, 112);
-  lv_obj_align(npArt, LV_ALIGN_TOP_MID, 0, 20);
-  lv_obj_set_style_radius(npArt, 24, 0);
+  lv_obj_set_size(npArt, 272, 130);
+  lv_obj_set_pos(npArt, 14, 22);
+  lv_obj_set_style_border_width(npArt, 2, 0);
+  lv_obj_set_style_border_color(npArt, C_TEXT, 0);
+  lv_obj_set_style_bg_color(npArt, C_SURF, 0);
   lv_obj_set_style_bg_opa(npArt, LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(npArt, C_ACC, 0);
-  lv_obj_set_style_bg_grad_color(npArt, C_PURP, 0);
-  lv_obj_set_style_bg_grad_dir(npArt, LV_GRAD_DIR_VER, 0);
   lv_obj_clear_flag(npArt, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(npArt, cbArt, LV_EVENT_CLICKED, NULL);
-  lv_obj_t* ic = mkLabel(npArt, LV_SYMBOL_AUDIO, &lv_font_montserrat_40, C_TEXT);
-  lv_obj_set_style_text_opa(ic, LV_OPA_80, 0);
+  lv_obj_t* ic = mkLabel(npArt, LV_SYMBOL_AUDIO, &lv_font_montserrat_40, C_DIM);
+  lv_obj_set_style_text_opa(ic, LV_OPA_60, 0);
   lv_obj_center(ic);
 
-  npTitle = mkLabel(tabNow, "Not playing", &lv_font_montserrat_16, C_TEXT);
-  lv_obj_set_width(npTitle, 216);
-  lv_label_set_long_mode(npTitle, LV_LABEL_LONG_SCROLL_CIRCULAR);
-  lv_obj_set_style_text_align(npTitle, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_align(npTitle, LV_ALIGN_TOP_MID, 0, 140);
-
-  npArtist = mkLabel(tabNow, "Pick a song in Library", &lv_font_montserrat_12, C_DIM);
-  lv_obj_set_width(npArtist, 216);
-  lv_label_set_long_mode(npArtist, LV_LABEL_LONG_DOT);
-  lv_obj_set_style_text_align(npArtist, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_align(npArtist, LV_ALIGN_TOP_MID, 0, 162);
-
-  npSeek = lv_slider_create(tabNow);
-  lv_slider_set_range(npSeek, 0, 1000);
-  lv_obj_set_width(npSeek, 208);
-  styleSlider(npSeek, 5);
-  lv_obj_align(npSeek, LV_ALIGN_TOP_MID, 0, 184);
-  lv_obj_add_event_cb(npSeek, cbSeek, LV_EVENT_RELEASED, NULL);
-
-  npEl = mkLabel(tabNow, "0:00", &lv_font_montserrat_12, C_DIM);
-  lv_obj_set_pos(npEl, 16, 194);
-  npRem = mkLabel(tabNow, "--:--", &lv_font_montserrat_12, C_DIM);
-  lv_obj_align(npRem, LV_ALIGN_TOP_RIGHT, -16, 194);
-
-  npPlay = mkBtn(tabNow, LV_SYMBOL_PLAY, &lv_font_montserrat_20, 46, 46, C_BG, cbPlay);
-  lv_obj_set_style_bg_opa(npPlay, LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(npPlay, C_TEXT, 0);
-  lv_obj_align(npPlay, LV_ALIGN_TOP_MID, 0, 210);
-  npPlayLbl = lv_obj_get_child(npPlay, 0);
-
-  lv_obj_t* pv = mkBtn(tabNow, LV_SYMBOL_PREV, &lv_font_montserrat_20, 40, 40, C_TEXT, cbPrev);
-  lv_obj_align(pv, LV_ALIGN_TOP_MID, -62, 213);
-  lv_obj_t* nx = mkBtn(tabNow, LV_SYMBOL_NEXT, &lv_font_montserrat_20, 40, 40, C_TEXT, cbNext);
-  lv_obj_align(nx, LV_ALIGN_TOP_MID, 62, 213);
-
-  npShuf = mkBtn(tabNow, LV_SYMBOL_SHUFFLE, &lv_font_montserrat_16, 34, 34, C_DIM, cbShuf);
-  lv_obj_align(npShuf, LV_ALIGN_TOP_MID, -102, 216);
-  npShufLbl = lv_obj_get_child(npShuf, 0);
-  npRep = mkBtn(tabNow, LV_SYMBOL_LOOP, &lv_font_montserrat_16, 34, 34, C_DIM, cbRep);
-  lv_obj_align(npRep, LV_ALIGN_TOP_MID, 102, 216);
-  npRepLbl = lv_obj_get_child(npRep, 0);
-
-  mkLabel(tabNow, LV_SYMBOL_VOLUME_MID, &lv_font_montserrat_14, C_DIM);
-  lv_obj_set_pos(lv_obj_get_child(tabNow, lv_obj_get_child_cnt(tabNow) - 1), 14, 257);
+  // volume: the green bar on the right edge (drag to set)
   npVol = lv_slider_create(tabNow);
   lv_slider_set_range(npVol, 0, 100);
   lv_slider_set_value(npVol, S.volume, LV_ANIM_OFF);
-  lv_obj_set_width(npVol, 170);
-  styleSlider(npVol, 5);
-  lv_obj_set_pos(npVol, 44, 262);
+  lv_obj_set_size(npVol, 14, 130);
+  lv_obj_set_pos(npVol, 300, 22);
+  styleBars(npVol);
   lv_obj_add_event_cb(npVol, cbVol, LV_EVENT_VALUE_CHANGED, NULL);
+
+  // title + artist (pixel font)
+  npTitle = mkLabel(tabNow, "Not playing", C_PIX, C_TEXT);
+  lv_obj_set_width(npTitle, 292);
+  lv_label_set_long_mode(npTitle, LV_LABEL_LONG_SCROLL_CIRCULAR);
+  lv_obj_set_pos(npTitle, 14, 156);
+
+  npArtist = mkLabel(tabNow, "Tap play to load music", C_PIX, C_DIM);
+  lv_obj_set_width(npArtist, 292);
+  lv_label_set_long_mode(npArtist, LV_LABEL_LONG_DOT);
+  lv_obj_set_pos(npArtist, 14, 174);
+
+  // progress
+  npSeek = lv_slider_create(tabNow);
+  lv_slider_set_range(npSeek, 0, 1000);
+  lv_obj_set_size(npSeek, 292, 8);
+  lv_obj_set_pos(npSeek, 14, 193);
+  styleBars(npSeek);
+  lv_obj_add_event_cb(npSeek, cbSeek, LV_EVENT_RELEASED, NULL);
+
+  // times: elapsed left, total right (like the reference)
+  npEl = mkLabel(tabNow, "0:00", C_PIX, C_TEXT);
+  lv_obj_set_pos(npEl, 14, 204);
+  npRem = mkLabel(tabNow, "0:00", C_PIX, C_TEXT);
+  lv_obj_align(npRem, LV_ALIGN_TOP_RIGHT, -14, 204);
+
+  // transport: prev / play / next
+  lv_obj_t* pv = mkBtn(tabNow, LV_SYMBOL_PREV, &lv_font_montserrat_14, 36, 22, C_TEXT, cbPrev);
+  lv_obj_set_pos(pv, 86, 218);
+  npPlay = mkBtn(tabNow, LV_SYMBOL_PLAY, &lv_font_montserrat_14, 48, 22, C_ACC, cbPlay);
+  lv_obj_set_pos(npPlay, 136, 218);
+  npPlayLbl = lv_obj_get_child(npPlay, 0);
+  lv_obj_t* nx = mkBtn(tabNow, LV_SYMBOL_NEXT, &lv_font_montserrat_14, 36, 22, C_TEXT, cbNext);
+  lv_obj_set_pos(nx, 200, 218);
+
+  // shuffle text (green when on)
+  lv_obj_t* sh = mkBtn(tabNow, "Shuffle", C_PIX, 62, 22, C_DIM, cbShuf);
+  lv_obj_align(sh, LV_ALIGN_TOP_RIGHT, -14, 218);
+  npShufLbl = lv_obj_get_child(sh, 0);
 }
 
 static void onTrackChanged() {
+  if (curPage != PAGE_NOW) return;             // rebuilt fresh when the page shows
   char t[64], a[48];
   Player::meta(t, sizeof(t), a, sizeof(a));
   int cur = Player::current();
   if (cur < 0) {
     lv_label_set_text(npTitle, "Not playing");
-    lv_label_set_text(npArtist, "Pick a song in Library");
-    lv_label_set_text(npCnt, "");
+    lv_label_set_text(npArtist, "Tap play to load music");
   } else {
     lv_label_set_text(npTitle, t[0] ? t : "Unknown");
     lv_label_set_text(npArtist, a[0] ? a : "Unknown artist");
-    lv_label_set_text_fmt(npCnt, "%d / %d", cur + 1, Library::count());
   }
   popIn(npTitle);
   popIn(npArtist);
   popIn(npArt);
-  forceRows();
 }
 
 // ------------------------------------------------------------------ settings page
@@ -404,8 +417,6 @@ static lv_obj_t* setRow(lv_obj_t* card, const char* text, int ctrlW = 0, lv_obj_
   lv_obj_clear_flag(r, (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
   lv_obj_t* l = mkLabel(r, text, &lv_font_montserrat_14, C_TEXT);
   if (ctrlW > 0) {
-    // 240px screen - 2x10 tab pad - 2x10 card pad = 200px row content width.
-    // Fixed label width + wrap makes label/control overlap impossible.
     lv_obj_set_width(l, 200 - ctrlW - 6);
     lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
   }
@@ -444,9 +455,11 @@ static lv_obj_t* addSlider(lv_obj_t* card, const char* text, int mn, int mx, int
   lv_slider_set_range(s, mn, mx);
   lv_slider_set_value(s, val, LV_ANIM_OFF);
   lv_obj_set_width(s, 60);
-  styleSlider(s, 5);
+  lv_obj_set_height(s, 5);
+  lv_obj_set_style_bg_color(s, C_SURF2, LV_PART_MAIN);
   lv_obj_set_style_bg_color(s, C_ACC, LV_PART_INDICATOR);
   lv_obj_set_style_bg_color(s, C_ACC, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(s, 3, LV_PART_KNOB);
   lv_obj_align(s, LV_ALIGN_LEFT_MID, 4, 0);
   lv_obj_add_event_cb(s, cb, LV_EVENT_VALUE_CHANGED, NULL);
   *valLabel = mkLabel(box, "", &lv_font_montserrat_12, C_DIM);
@@ -495,11 +508,12 @@ static void cbLimit(lv_event_t* e) {
   S.volLimit = v;
   lv_label_set_text_fmt(lblLimit, "%d%%", v);
   Player::setVolume(S.volume);                       // re-clamp
-  lv_slider_set_value(npVol, S.volume, LV_ANIM_OFF);
+  if (curPage == PAGE_NOW && npVol) lv_slider_set_value(npVol, S.volume, LV_ANIM_OFF);
 }
 static void cbSleep(lv_event_t*) { Hal::deepSleep(); }
 
 static void cbRescan(lv_event_t*) {
+  if (!Library::start()) return;
   Player::stop();
   delay(120);
   Library::rescan();
@@ -573,6 +587,7 @@ static void openDlg(int kind, const char* title, const char* txt) {
 
 static void showPicker();
 static void cbPair(lv_event_t*) {
+  Player::ensureBt();                          // the scan needs the stack up
   if (Player::scanMode()) showPicker();
   else openDlg(1, "Pair headphones", "The player restarts to search for Bluetooth headphones. Put them in pairing mode.");
 }
@@ -587,6 +602,9 @@ static void buildSettings() {
   lv_obj_set_style_pad_row(tabSet, 6, 0);
   lv_obj_set_flex_flow(tabSet, LV_FLEX_FLOW_COLUMN);
 
+  lv_obj_t* back = mkBtn(tabSet, LV_SYMBOL_LEFT, &lv_font_montserrat_14, 26, 20, C_TEXT,
+                         [](lv_event_t*){ showPage(prevPage); });
+  lv_obj_set_pos(back, -4, 0);
   lv_obj_t* hdr = mkLabel(tabSet, "Settings", &lv_font_montserrat_20, C_TEXT);
   lv_obj_set_style_pad_left(hdr, 4, 0);
 
@@ -617,7 +635,7 @@ static void buildSettings() {
     lv_obj_center(lb);
     lv_obj_add_event_cb(b, cbLookChip, LV_EVENT_CLICKED, (void*)(intptr_t)i);
   }
-  setRow(c, "Accent colour");                       // label row, swatches on their own row
+  setRow(c, "Accent colour");                       // swatches on their own row
   lv_obj_t* swr = lv_obj_create(c);
   lv_obj_remove_style_all(swr);
   lv_obj_set_width(swr, LV_PCT(100));
@@ -732,50 +750,70 @@ static void uiTick(lv_timer_t*) {
   uint32_t ser = Player::serial();
   if (ser != lastSerial) { lastSerial = ser; onTrackChanged(); }
 
-  static int lastAct = -1;
-  bool act = Player::active();
-  if (act != lastAct) {
-    lastAct = act;
-    lv_label_set_text(npPlayLbl, act ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
-    setBreathing(act);
-  }
+  if (curPage == PAGE_NOW) {
+    static int lastAct = -1;
+    bool act = Player::active();
+    if (act != lastAct) {
+      lastAct = act;
+      lv_label_set_text(npPlayLbl, act ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+      setBreathing(act);
+    }
 
-  static int lastShuf = -1, lastRep = -1;
-  if (lastShuf != S.shuffle) {
-    lastShuf = S.shuffle;
-    lv_obj_set_style_text_color(npShufLbl, S.shuffle ? C_ACC : C_DIM, 0);
-  }
-  if (lastRep != S.repeat) {
-    lastRep = S.repeat;
-    lv_label_set_text(npRepLbl, S.repeat == 2 ? LV_SYMBOL_LOOP "1" : LV_SYMBOL_LOOP);
-    lv_obj_set_style_text_color(npRepLbl, S.repeat ? C_ACC : C_DIM, 0);
-  }
+    static int lastShuf = -1;
+    if (lastShuf != S.shuffle) {
+      lastShuf = S.shuffle;
+      lv_obj_set_style_text_color(npShufLbl, S.shuffle ? C_ACC : C_DIM, 0);
+    }
 
-  if (!lv_slider_is_dragged(npSeek))
-    lv_slider_set_value(npSeek, (int)(Player::fraction() * 1000), animFlag());
+    if (!lv_slider_is_dragged(npSeek))
+      lv_slider_set_value(npSeek, (int)(Player::fraction() * 1000), animFlag());
 
-  static uint32_t lastEl = 0xFFFFFFFF, lastTot = 0xFFFFFFFF;
-  uint32_t el = (uint32_t)Player::position(), tot = Player::duration();
-  if (!Player::loaded()) { el = 0; tot = 0; }
-  if (el != lastEl || tot != lastTot) {
-    lastEl = el; lastTot = tot;
-    char b[12];
-    fmtTime(b, sizeof(b), el);
-    lv_label_set_text(npEl, b);
-    if (tot) { fmtTime(b, sizeof(b), tot > el ? tot - el : 0); char m[14]; snprintf(m, sizeof(m), "-%s", b); lv_label_set_text(npRem, m); }
-    else lv_label_set_text(npRem, "--:--");
-  }
+    static uint32_t lastEl = 0xFFFFFFFF, lastTot = 0xFFFFFFFF;
+    uint32_t el = (uint32_t)Player::position(), tot = Player::duration();
+    if (!Player::loaded()) { el = 0; tot = 0; }
+    if (el != lastEl || tot != lastTot) {
+      lastEl = el; lastTot = tot;
+      char b[12];
+      fmtTime(b, sizeof(b), el);
+      lv_label_set_text(npEl, b);
+      if (tot) { fmtTime(b, sizeof(b), tot); lv_label_set_text(npRem, b); }
+      else lv_label_set_text(npRem, "0:00");
+    }
 
-  bool conn = Player::btConnected();
-  if (Player::scanMode()) {
-    lv_label_set_text(npBt, LV_SYMBOL_BLUETOOTH "  Pairing mode");
-    lv_obj_set_style_text_color(npBt, C_ACC, 0);
-  } else if (conn) {
-    lv_label_set_text(npBt, LV_SYMBOL_BLUETOOTH "  Connected");
-    lv_obj_set_style_text_color(npBt, C_BLUE, 0);
-  } else {
-    lv_label_set_text(npBt, LV_SYMBOL_BLUETOOTH "  Searching...");
-    lv_obj_set_style_text_color(npBt, C_DIM, 0);
+    // the artist line alternates with the upcoming track, like the reference
+    static uint32_t lastFlip = 0;
+    static bool showNext = false;
+    static char artistBuf[48] = "";
+    if (Player::loaded() && millis() - lastFlip > 4000) {
+      lastFlip = millis();
+      showNext = !showNext;
+      if (showNext) {
+        int n = Library::count();
+        if (n > 1) {
+          int nxt = (Player::current() + 1) % n;
+          char t[64], a[48];
+          Library::displayName(nxt, t, sizeof(t), a, sizeof(a));
+          lv_label_set_text_fmt(npArtist, "Next: %s", t);
+        }
+      } else {
+        lv_label_set_text(npArtist, artistBuf[0] ? artistBuf : "Unknown artist");
+      }
+    }
+
+    bool conn = Player::btConnected();
+    if (Player::scanMode()) {
+      lv_label_set_text(npBt, LV_SYMBOL_BLUETOOTH " Pairing");
+      lv_obj_set_style_text_color(npBt, C_ACC, 0);
+    } else if (conn) {
+      lv_label_set_text(npBt, LV_SYMBOL_BLUETOOTH " Connected");
+      lv_obj_set_style_text_color(npBt, C_BLUE, 0);
+    } else if (Player::btStarted()) {
+      lv_label_set_text(npBt, LV_SYMBOL_BLUETOOTH " Searching");
+      lv_obj_set_style_text_color(npBt, C_DIM, 0);
+    } else {
+      lv_label_set_text(npBt, LV_SYMBOL_BLUETOOTH " Off");
+      lv_obj_set_style_text_color(npBt, C_DIM, 0);
+    }
   }
 
   if (pickPanel && pickList && Player::scanCount() != pickShown) {
@@ -787,21 +825,46 @@ static void uiTick(lv_timer_t*) {
     }
   }
 
-  if (lv_tabview_get_tab_act(tv) == 2) {
+  if (curPage == PAGE_SET) {
     static uint32_t lastInfo = 0;
     if (millis() - lastInfo > 1500) {
       lastInfo = millis();
       lv_label_set_text_fmt(setInfo, "%d tracks  |  heap %u KB  |  v%s",
-                            Library::count(), (unsigned)(ESP.getFreeHeap() / 1024), FW_VERSION);
+                            Library::started() ? Library::count() : 0,
+                            (unsigned)(ESP.getFreeHeap() / 1024), FW_VERSION);
       lv_label_set_text(setBtLbl, S.btName[0]
         ? S.btName : (Player::scanMode() ? "pairing..." : "not paired"));
     }
   }
 }
 
+// ------------------------------------------------------------------ pages
+static void buildPage(int p) {
+  if (p == PAGE_LIB) { Library::start(); tabLib = pageObj; buildLibrary(); }
+  else if (p == PAGE_NOW) { tabNow = pageObj; buildNowPlaying(); onTrackChanged(); }
+  else { tabSet = pageObj; buildSettings(); }
+}
+
+static void showPage(int p) {
+  if (curPage == p) return;
+  if (p == PAGE_SET) prevPage = curPage;        // Settings returns to where it came from
+  if (pageObj) {
+    if (curPage == PAGE_NOW) setBreathing(false);   // stop anims before the widgets die
+    lv_obj_del(pageObj);
+    pageObj = nullptr;
+  }
+  curPage = p;
+  pageObj = lv_obj_create(lv_scr_act());
+  lv_obj_remove_style_all(pageObj);
+  lv_obj_set_size(pageObj, SCR_W, SCR_H);
+  lv_obj_clear_flag(pageObj, LV_OBJ_FLAG_SCROLLABLE);
+  buildPage(p);
+}
+
+// ------------------------------------------------------------------ API
 void UI::setActive(bool on) {
   uiActive = on;
-  if (tv) setBreathing(on && Player::active());
+  if (curPage == PAGE_NOW) setBreathing(on && Player::active());
 }
 
 void UI::build() {
@@ -810,58 +873,13 @@ void UI::build() {
   lv_obj_set_style_bg_color(scr, C_BG, 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-  tv = lv_tabview_create(scr, LV_DIR_BOTTOM, TAB_H);
-  lv_obj_set_size(tv, SCR_W, SCR_H);
-  lv_obj_set_style_bg_color(tv, C_BG, 0);
-
-  lv_obj_t* content = lv_tabview_get_content(tv);
-  lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);       // pages change via the tab bar only
-  lv_obj_set_style_bg_color(content, C_BG, 0);
-
-  lv_obj_t* btns = lv_tabview_get_tab_btns(tv);
-  lv_obj_set_style_bg_color(btns, C_SURF, 0);
-  lv_obj_set_style_text_font(btns, &lv_font_montserrat_20, 0);
-  lv_obj_set_style_text_color(btns, C_DIM, 0);
-  lv_obj_set_style_text_color(btns, C_ACC, LV_PART_ITEMS | LV_STATE_CHECKED);
-  lv_obj_set_style_bg_opa(btns, LV_OPA_TRANSP, LV_PART_ITEMS);
-  lv_obj_set_style_bg_opa(btns, LV_OPA_TRANSP, LV_PART_ITEMS | LV_STATE_CHECKED);
-  lv_obj_set_style_bg_opa(btns, LV_OPA_TRANSP, LV_PART_ITEMS | LV_STATE_PRESSED);
-  lv_obj_set_style_border_side(btns, LV_BORDER_SIDE_TOP, LV_PART_ITEMS | LV_STATE_CHECKED);
-  lv_obj_set_style_border_width(btns, 3, LV_PART_ITEMS | LV_STATE_CHECKED);
-  lv_obj_set_style_border_color(btns, C_ACC, LV_PART_ITEMS | LV_STATE_CHECKED);
-
-  tabLib = lv_tabview_add_tab(tv, LV_SYMBOL_LIST);
-  tabNow = lv_tabview_add_tab(tv, LV_SYMBOL_AUDIO);
-  tabSet = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS);
-  lv_obj_t* tabs[3] = {tabLib, tabNow, tabSet};
-  for (int i = 0; i < 3; i++) {
-    lv_obj_set_style_pad_all(tabs[i], 0, 0);
-    lv_obj_set_style_border_width(tabs[i], 0, 0);
-    lv_obj_set_style_bg_opa(tabs[i], LV_OPA_TRANSP, 0);
-  }
-  lv_obj_set_style_pad_all(tabSet, 10, 0);
-
-  buildLibrary();
-  buildNowPlaying();
-  buildSettings();
-  applyAnimSetting();
-  onTrackChanged();
-
   lv_timer_create(uiTick, 250, NULL);
 
   if (Player::scanMode()) {
-    lv_tabview_set_act(tv, 2, LV_ANIM_OFF);
+    showPage(PAGE_SET);
     showPicker();
+  } else {
+    showPage(PAGE_NOW);                       // the iPod Now Playing screen
   }
-
-  // gentle intro: whole UI fades in
-  lv_obj_set_style_opa(tv, LV_OPA_TRANSP, 0);
-  lv_anim_t a;
-  lv_anim_init(&a);
-  lv_anim_set_var(&a, tv);
-  lv_anim_set_exec_cb(&a, [](void* o, int32_t v) { lv_obj_set_style_opa((lv_obj_t*)o, (lv_opa_t)v, 0); });
-  lv_anim_set_values(&a, 0, 255);
-  lv_anim_set_time(&a, S.animations ? 450 : 1);
-  lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-  lv_anim_start(&a);
+  applyAnimSetting();
 }

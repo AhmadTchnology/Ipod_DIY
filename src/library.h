@@ -2,7 +2,8 @@
 #include <Arduino.h>
 
 namespace Library {
-  void begin();                 // mount SD + load (or build) /music.idx
+  bool start();                 // mount SD + load (or build) /music.idx (idempotent)
+  bool started();               // true once start() has run
   void rescan();                // rebuild the /music.idx index (stops playback first!)
   bool sdOk();
   int  count();

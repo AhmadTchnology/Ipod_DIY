@@ -2,7 +2,10 @@
 #include <Arduino.h>
 
 namespace Player {
-  void begin();                 // decoder task + Bluetooth A2DP source
+  void prealloc();              // call EARLY in setup(): pin the helix buffers
+  void begin();                 // decoder task + PCM ring (cheap; no Bluetooth)
+  void ensureBt();              // start the Bluetooth stack on first play
+  bool btStarted();             // ensureBt() has run
   void update();                // call from loop(): track-end handling
   void play(int idx);
   void toggle();

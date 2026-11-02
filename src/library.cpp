@@ -52,6 +52,7 @@ static bool filling;
 // from core 0 while the UI task reads the index from core 1. One mutex for
 // every file operation that crosses tasks.
 static SemaphoreHandle_t sdMx = nullptr;
+static bool libStarted = false;
 
 void Library::sdEnter() { if (sdMx) xSemaphoreTake(sdMx, portMAX_DELAY); }
 void Library::sdExit()  { if (sdMx) xSemaphoreGive(sdMx); }
@@ -207,12 +208,16 @@ static bool publishIdx() {
 
 // ------------------------------------------------------------ public API
 
-void Library::begin() {
+bool Library::started() { return libStarted; }
+
+bool Library::start() {                       // called lazily: first play / library view
+  if (libStarted) return sdReady;
+  libStarted = true;
   sdMx = xSemaphoreCreateMutex();
   sdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   sdReady = SD.begin(SD_CS, sdSpi, 20000000);
   Serial.printf("SD: %s\n", sdReady ? "ok" : "not found");
-  if (!sdReady) return;
+  if (!sdReady) return false;
   bool rebuild = Cfg::libDirty();            // receiver downloaded new files
   if (!rebuild) rebuild = !loadIdx();        // no (or broken/stale-format) index
   if (!rebuild && nTracks == 0) {            // empty index but not dirty: new
@@ -223,6 +228,7 @@ void Library::begin() {
     Serial.println("Library: building /music.idx (scanning card) ...");
     rescan();                                // stop playback first (UI does that)
   }
+  return true;
 }
 
 // one-time diagnostic helper: prints the card layout when the scan finds no
