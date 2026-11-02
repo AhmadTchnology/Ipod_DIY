@@ -158,6 +158,7 @@ static bool loadIdx() {
     ok = f.read((uint8_t*)probe, 4) == 4 && probe[0] != 0;
   }
   if (!ok) {
+    Serial.println("Library: /music.idx invalid - rescan needed");
     f.close();
     free(offs); offs = nullptr;
     return false;
@@ -184,20 +185,19 @@ static bool publishIdx() {
   bool ok = false;
   File f = SD.open(IDX_PATH, "w");
   if (f) {
-    ok = true;
+    // header + offset table FIRST, then the strings append right after
+    // them — the offsets then match the physical layout exactly (seeking
+    // back over already-written strings would corrupt the first entries)
+    uint32_t magic = IDX_MAGIC;
+    uint16_t ver = IDX_VER, cnt = (uint16_t)n, rf = rootIsMusic ? 1 : 0;
+    ok = f.write((uint8_t*)&magic, 4) == 4 &&
+         f.write((uint8_t*)&ver, 2) == 2 &&
+         f.write((uint8_t*)&cnt, 2) == 2 &&
+         f.write((uint8_t*)&rf, 2) == 2 &&
+         f.write((uint8_t*)fo, 4 * n) == 4 * n;
     for (int k = 0; k < n && ok; k++) {
       const char* s = pool + tofs[k];
       ok = f.write((const uint8_t*)s, strlen(s) + 1) == strlen(s) + 1;
-    }
-    if (ok) {
-      uint32_t magic = IDX_MAGIC;
-      uint16_t ver = IDX_VER, cnt = (uint16_t)n, rf = rootIsMusic ? 1 : 0;
-      ok = f.seek(0) &&
-           f.write((uint8_t*)&magic, 4) == 4 &&
-           f.write((uint8_t*)&ver, 2) == 2 &&
-           f.write((uint8_t*)&cnt, 2) == 2 &&
-           f.write((uint8_t*)&rf, 2) == 2 &&
-           f.write((uint8_t*)fo, 4 * n) == 4 * n;
     }
     f.close();
   }

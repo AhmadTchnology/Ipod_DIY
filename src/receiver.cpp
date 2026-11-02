@@ -18,6 +18,7 @@
 #include "config.h"
 #include "hal.h"
 #include "settings.h"
+#include <esp_heap_caps.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WiFiClientSecure.h>
@@ -196,12 +197,23 @@ static bool isAudioDoc(const char* mime, const char* name) {
 
 // ============================ telegram ==============================
 
-// one HTTPS request/response cycle; body returned; returns HTTP code
-static int tgGet(WiFiClientSecure& tl, const char* url, String& body) {
+// Telegram API base — switchable so a plain-HTTP relay on the laptop can
+// stand in for TLS when the pod's heap cannot fit an mbedTLS session:
+//   apibase http://192.168.x.x:8080/tg    (laptop proxy forwards to telegram)
+static char apiBase[64] = "https://api.telegram.org";
+
+// one GET against apiBase; body returned; returns HTTP code.
+// picks TLS (WiFiClientSecure, insecure) or plain WiFiClient by URL prefix
+static int apiGet(const char* url, String& body) {
+  bool tls = strncasecmp(url, "https", 5) == 0;
   HTTPClient http;
   http.setTimeout(15000);
   http.setConnectTimeout(15000);
-  if (!http.begin(tl, url)) return -1;
+  WiFiClient plainCls;
+  WiFiClientSecure tlCls;
+  if (tls) tlCls.setInsecure();
+  bool ok = tls ? http.begin(tlCls, url) : http.begin(plainCls, url);
+  if (!ok) return -1;
   int code = http.GET();
   if (code > 0) body = http.getString();
   http.end();
@@ -220,10 +232,7 @@ static void rxTask(void*) {  if (!SD.begin(SD_CS)) {
     SD.mkdir("/music/telegram");
   }
 
-  WiFiClientSecure tl;
-  tl.setInsecure();
-
-  char fid[80] = "", fname[96] = "", mime[40] = "";
+  char fid[128] = "", fname[96] = "", mime[40] = "";
   int backoff = 0;
 
   for (;;) {
@@ -253,11 +262,11 @@ static void rxTask(void*) {  if (!SD.begin(SD_CS)) {
     }
 
     char url[250];
-    snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/getUpdates?limit=1&offset=%lld&timeout=0",
-             c.tok, (long long)rxOffset);
+    snprintf(url, sizeof(url), "%s/bot%s/getUpdates?limit=1&offset=%lld&timeout=0",
+             apiBase, c.tok, (long long)rxOffset);
     tgState = 1;
     String body;
-    int code = tgGet(tl, url, body);
+    int code = apiGet(url, body);
     if (code == 401) {
       tgState = 3;
       snprintf(txtErr, sizeof(txtErr), "bot refused token (check it)");
@@ -265,6 +274,10 @@ static void rxTask(void*) {  if (!SD.begin(SD_CS)) {
       continue;
     }
     if (code != 200) {
+      if (millis() < 120000)                     // early diagnostics only
+        Serial.printf("[RX] poll code=%d heap=%u bigfree=%u\n", code,
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
       snprintf(txtErr, sizeof(txtErr), "telegram poll failed (%d)", code);
       vTaskDelay(pdMS_TO_TICKS(3000));
       continue;
@@ -283,15 +296,21 @@ static void rxTask(void*) {  if (!SD.begin(SD_CS)) {
 
     // inspect the update for a document/audio attachment
     bool handled = false;
+    bool sawFile = false;
     int p = 0;
     while (!handled) {
       p = jsonStrVal(body, "file_id", fid, sizeof(fid), p);
       if (p < 0) break;
-      if (jsonStrVal(body, "file_name", fname, sizeof(fname), p) < 0) fname[0] = '\0';
-      if (jsonStrVal(body, "mime_type", mime, sizeof(mime), p) < 0) mime[0] = '\0';
+      sawFile = true;
+      // Telegram's document/audio objects list file_name and mime_type
+      // BEFORE file_id — searching them from the file_id hit would miss
+      // them entirely and every song would look like "not audio". Parse
+      // each field from the start of the (single-)update body instead.
+      if (jsonStrVal(body, "file_name", fname, sizeof(fname)) < 0) fname[0] = '\0';
+      if (jsonStrVal(body, "mime_type", mime, sizeof(mime)) < 0) mime[0] = '\0';
       // audio-style sends (Telegram's music player) carry no file_name: fall
       // back to the track title, then a numbered name so songs never collide
-      if (!fname[0] && jsonStrVal(body, "title", fname, sizeof(fname), p) < 0)
+      if (!fname[0] && jsonStrVal(body, "title", fname, sizeof(fname)) < 0)
         fname[0] = '\0';
       if (!fname[0]) snprintf(fname, sizeof(fname), "audio_%lld", (long long)id + 1);
       if (isAudioDoc(mime, fname)) {
@@ -305,15 +324,22 @@ static void rxTask(void*) {  if (!SD.begin(SD_CS)) {
       }
       p += 1;
     }
+    if (!sawFile) handled = true;          // text/photo/etc: not a song -> advance
 
     if (handled) {
       rxOffset = id + 1;
       backoff = 0;
     } else {
-      // download failed (usually no SD / card error): retry same update later
+      // one bad file must not wedge the whole queue: retry briefly, then skip
       backoff++;
-      vTaskDelay(pdMS_TO_TICKS(backoff > 2 ? 10000 : 3000));
-      continue;
+      vTaskDelay(pdMS_TO_TICKS(backoff > 3 ? 8000 : 3000));
+      if (backoff > 6) {                   // ~40 s of retries, then move on
+        Serial.printf("[RX] save failed for %s - skipping\n", fname);
+        rxOffset = id + 1;
+        backoff = 0;
+      } else {
+        continue;
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(1200));
   }
@@ -322,14 +348,12 @@ static void rxTask(void*) {  if (!SD.begin(SD_CS)) {
 static bool saveMessage(long long chatId, long long updateId, const char* tok,
                         const char* fileId, const char* fileName) {
   (void)updateId;
-  WiFiClientSecure tl;
-  tl.setInsecure();
 
   // 1. resolve file path (Telegram file ids are URL-safe characters)
   char url[400];
-  snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/getFile?file_id=%s", tok, fileId);
+  snprintf(url, sizeof(url), "%s/bot%s/getFile?file_id=%s", apiBase, tok, fileId);
   String body;
-  int code = tgGet(tl, url, body);
+  int code = apiGet(url, body);
   if (code != 200) {
     snprintf(txtErr, sizeof(txtErr), "getFile failed (%d)", code);
     return false;
@@ -361,11 +385,21 @@ static bool saveMessage(long long chatId, long long updateId, const char* tok,
   // 3. stream the file down (HTTPClient streams, no full-body buffer)
   tgState = 2;
   snprintf(txtErr, sizeof(txtErr), "saving %s...", sane);
+  bool dls = strncasecmp(apiBase, "https", 5) == 0;   // same scheme as the API
+  snprintf(url, sizeof(url), "%s/file/bot%s/%s", apiBase, tok, fpath);
   HTTPClient http;
-  http.setTimeout(8000);                    // read timeout
+  http.setTimeout(30000);                   // read timeout (relay fetches before replying)
   http.setConnectTimeout(8000);
-  snprintf(url, sizeof(url), "https://api.telegram.org/file/bot%s/%s", tok, fpath);
-  if (!http.begin(tl, url)) {
+  WiFiClient wcDl;                          // must outlive the transfer
+  WiFiClientSecure tlDl;
+  bool opened;
+  if (dls) {
+    tlDl.setInsecure();
+    opened = http.begin(tlDl, url);
+  } else {
+    opened = http.begin(wcDl, url);
+  }
+  if (!opened) {
     tgState = 1;
     snprintf(txtErr, sizeof(txtErr), "file download open failed");
     return false;
@@ -399,20 +433,19 @@ static bool saveMessage(long long chatId, long long updateId, const char* tok,
 
   // 4. acknowledge in the chat so the user sees it landed (needs chat_id!)
   if (chatId > 0) {
-    WiFiClientSecure tl2;
-    tl2.setInsecure();
     String text = "Saved to MyPod: ";
     text += sane;
     String enc;
     pctEncode(text.c_str(), enc, 140);
-    String aurl = "https://api.telegram.org/bot";
+    String aurl = apiBase;
+    aurl += "/bot";
     aurl += tok;
     aurl += "/sendMessage?chat_id=";
     aurl += String((long long)chatId);
     aurl += "&text=";
     aurl += enc;
     String junk;
-    tgGet(tl2, aurl.c_str(), junk);
+    apiGet(aurl.c_str(), junk);
   }
   return true;
 }
@@ -536,6 +569,93 @@ static void drawStatic() {
   Hal::tft.drawString("Hold BOOT 3s = player", 8, 296);
 }
 
+// wipes /music recursively + /music.idx — fresh start for the library
+static bool rmTree(const char* path) {
+  bool ok = true;
+  File d = SD.open(path);
+  if (!d) return true;                       // already gone
+  if (!d.isDirectory()) { d.close(); return SD.remove(path); }
+  for (;;) {
+    File f = d.openNextFile();
+    if (!f) break;
+    char child[PATH_MAX_LEN];
+    snprintf(child, sizeof(child), "%s/%s", path, f.name());
+    bool isDir = f.isDirectory();
+    f.close();
+    if (isDir) ok &= rmTree(child);
+    else ok &= SD.remove(child);
+  }
+  d.close();
+  return ok && SD.rmdir(path);
+}
+
+// --- plain-HTTP pull (no TLS at all): serial cmd
+//   pull http://laptop:port/some%20name.mp3 [some%20name.mp3]
+// the laptop provides the file when Telegram TLS cannot fit in RAM
+static void urlDecode(const char* src, char* dst, size_t cap) {
+  size_t o = 0;
+  for (size_t i = 0; src[i] && o + 1 < cap; i++) {
+    if (src[i] == '%' && src[i + 1] && src[i + 2]) {
+      char h[3] = { src[i + 1], src[i + 2], 0 };
+      dst[o++] = (char)strtol(h, nullptr, 16);
+      i += 2;
+    } else {
+      dst[o++] = src[i];
+    }
+  }
+  dst[o] = 0;
+}
+
+static void pullUrl(const char* args) {
+  char tmp[300];
+  strlcpy(tmp, args, sizeof(tmp));
+  char* sp = strchr(tmp, ' ');
+  if (sp) *sp = '\0';                        // url part
+  const char* arg2 = sp ? sp + 1 : nullptr;
+
+  const char* url = tmp;                     // keep %20 encoded on the wire
+  if (strncasecmp(url, "http://", 7) != 0) {
+    Serial.println("[RX] usage: pull http://laptop:port/file%20name.mp3 [file%20name.mp3]");
+    return;
+  }
+  char fname[128];                           // decoded destination name
+  const char* b = strrchr(url, '/');         // destination: arg2 or URL basename
+  urlDecode(arg2 && *arg2 ? arg2 : (b ? b + 1 : ""), fname, sizeof(fname));
+  if (!fname[0]) { Serial.println("[RX] pull: no file name"); return; }
+
+  char sane[96];
+  sanitizeName(fname, sane, sizeof(sane));
+  char path[PATH_MAX_LEN];
+  snprintf(path, sizeof(path), "/music/%s", sane);
+  char finalPath[PATH_MAX_LEN];
+  strlcpy(finalPath, path, sizeof(finalPath));
+  int dup = 2;
+  while (SD.exists(finalPath) && dup < 99) {
+    snprintf(finalPath, sizeof(finalPath), "%s_%d", path, dup);
+    dup++;
+  }
+
+  WiFiClient wc;                             // plain HTTP, no TLS buffers
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.setConnectTimeout(8000);
+  if (!http.begin(wc, url)) { Serial.println("[RX] pull: connect failed"); return; }
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("[RX] pull failed (%d)\n", code);
+    http.end();
+    return;
+  }
+  File f = SD.open(finalPath, FILE_WRITE);
+  if (!f) { Serial.println("[RX] pull: SD open failed"); http.end(); return; }
+  int wr = http.writeToStream(&f);
+  f.close();
+  http.end();
+  if (wr <= 0) { Serial.println("[RX] pull: transfer aborted"); return; }
+  Cfg::setLibDirty(true);                    // player rebuilds /music.idx next boot
+  Serial.printf("[RX] pulled %s (%d bytes)\n", finalPath, wr);
+}
+
 // ============================ API ===================================
 
 void run() {
@@ -545,6 +665,12 @@ void run() {
   Serial.println("[RX] WiFi receiver mode");
 
   credsLoad();
+  {                            // remember the bridge/base URL across reboots
+    Preferences p;
+    p.begin("rx", true);
+    p.getString("abase", apiBase, sizeof(apiBase));   // keeps https default if absent
+    p.end();
+  }
   WiFi.mode(WIFI_AP_STA);
 
   String mac = WiFi.macAddress();
@@ -560,13 +686,14 @@ void run() {
   server.on("/exit", hExit);
   server.begin();
 
-  xTaskCreatePinnedToCore(rxTask, "tgrx", 24576, nullptr, 3, nullptr, 0);
+  xTaskCreatePinnedToCore(rxTask, "tgrx", 12288, nullptr, 3, nullptr, 0);
 
   drawStatic();
 
   uint32_t lastUi = 0, lastHomeTry = 0;
   int bootHold = 0;
   bool homeAttempted = false;
+  bool staMode = false;                      // AP down once home WiFi confirms
 
   for (;;) {
     server.handleClient();
@@ -581,7 +708,7 @@ void run() {
     }
 
     // serial console for the laptop (no phone needed)
-    static char lbuf[80];
+    static char lbuf[300];
     static size_t ln = 0;
     while (Serial.available()) {
       char ch = Serial.read();
@@ -591,10 +718,11 @@ void run() {
         if (ln) {
           if (!strcasecmp(lbuf, "exit")) exitToPlayer();
           else if (!strcasecmp(lbuf, "info")) {
-            Serial.printf("[RX] ap=%s ip=%s home=%s(%s=%d) tok=%s sd=%d saved=%d err=%s\n",
+            Serial.printf("[RX] ap=%s ip=%s home=%s(%s=%d) tok=%s sd=%d saved=%d heap=%u err=%s\n",
                           apName, WiFi.softAPIP().toString().c_str(),
                           (WiFi.status() == WL_CONNECTED ? "up" : "down"),
-                          creds.ssid, WiFi.status(), creds.tok, (int)sdOk, rxCount, txtErr);
+                          creds.ssid, WiFi.status(), creds.tok, (int)sdOk, rxCount,
+                          (unsigned)ESP.getFreeHeap(), txtErr);
           } else if (!strncasecmp(lbuf, "cred ", 5)) {
             // cred <ssid> <password> <token>
             char a[3][70];
@@ -606,7 +734,33 @@ void run() {
               credsStore();
               Serial.println("[RX] creds stored");
             } else Serial.println("[RX] usage: cred ssid pass tok");
-          } else Serial.println("[RX] ? (exit/info/cred ssid pass tok)");
+          } else if (!strncasecmp(lbuf, "apibase ", 8)) {
+            strlcpy(apiBase, lbuf + 8, sizeof(apiBase));
+            { Preferences p; p.begin("rx", false); p.putString("abase", apiBase); p.end(); }
+            Serial.printf("[RX] api base: %s (saved)\n", apiBase);
+          } else if (!strncasecmp(lbuf, "rm ", 3)) {
+            // rm /music/<name.mp3> - delete a file from the card
+            char pth[PATH_MAX_LEN];
+            urlDecode(lbuf + 3, pth, sizeof(pth));
+            if (strncasecmp(pth, "/music/", 7) != 0 || strstr(pth, "..")) {
+              Serial.println("[RX] rm: only /music/... paths");
+            } else if (!SD.exists(pth)) {
+              Serial.printf("[RX] rm: no such file %s\n", pth);
+            } else {
+              SD.remove(pth);
+              Cfg::setLibDirty(true);
+              Serial.printf("[RX] rm: deleted %s\n", pth);
+            }
+          } else if (!strcasecmp(lbuf, "rmall")) {
+            // delete every song + the index (fresh library start)
+            if (rmTree("/music")) Serial.println("[RX] rmall: /music cleared");
+            else Serial.println("[RX] rmall: some entries refused, retry");
+            SD.mkdir("/music");                  // pulls expect the folder to exist
+            SD.remove("/music.idx");
+            Cfg::setLibDirty(true);
+          } else if (!strncasecmp(lbuf, "pull ", 5)) {
+            pullUrl(lbuf + 5);              // file over plain HTTP from laptop
+          } else Serial.println("[RX] ? (exit/info/apibase url/pull url/rmall/cred ssid pass tok)");
         }
         ln = 0;
         continue;
@@ -622,6 +776,17 @@ void run() {
       homeAttempted = true;
     }
     if (!credsValid) homeAttempted = false;
+
+    // once home WiFi is up, retire the hotspot and soften the radio RAM
+    // pressure — mbedTLS needs ~45 KB heap and the AP mode held part of it
+    if (!staMode && WiFi.status() == WL_CONNECTED) {
+      staMode = true;
+      WiFi.setSleep(true);
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_MODE_STA);
+      Serial.printf("[RX] home up %s heap=%u\n",
+                    WiFi.localIP().toString().c_str(), (unsigned)ESP.getFreeHeap());
+    }
 
     // status lines under the fixed instructions (kept short for the TFT)
     if (millis() - lastUi > 1000) {
