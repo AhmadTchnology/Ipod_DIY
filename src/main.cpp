@@ -31,6 +31,11 @@ void setup() {
   Hal::lvglInit();
   Serial.printf("[heap] after lvgl: %u\n", (unsigned)ESP.getFreeHeap());
   UI::build();
+  lv_mem_monitor_t m;
+  lv_mem_monitor(&m);
+  Serial.printf("[lvgl] pool total=%u free=%u maxused=%u frag=%u%%\n",
+                (unsigned)m.total_size, (unsigned)m.free_size,
+                (unsigned)m.max_used, (unsigned)m.frag_pct);
   Hal::applyPower();
   Serial.printf("Free heap after boot: %u bytes\n", (unsigned)ESP.getFreeHeap());
 }
@@ -45,6 +50,18 @@ void loop() {
   Player::update();
   Hal::tick();
   Cfg::tick();
+
+  // first-minute heap probe: traces the Bluetooth connect window + the UI at
+  // runtime; self-terminates to keep the console quiet in normal use
+  static uint32_t lastHp = 0;
+  if (now - lastHp > 5000 && now < 90000) {
+    lastHp = now;
+    lv_mem_monitor_t m;
+    lv_mem_monitor(&m);
+    Serial.printf("[heap t=%us] free=%u min=%u lvglfree=%u\n", now / 1000,
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+                  (unsigned)m.free_size);
+  }
 
   delay(Hal::isScreenOn() ? constrain(wait, 3, 15) : 40);
 }

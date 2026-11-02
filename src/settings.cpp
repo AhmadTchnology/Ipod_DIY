@@ -45,3 +45,20 @@ void Cfg::saveSoon() { dirty = true; dirtyAt = millis(); }
 void Cfg::tick() {
   if (dirty && millis() - dirtyAt > 2000) save();
 }
+
+// library-changed flag, kept directly in NVS so the receiver task can set it
+// and the next pod boot (which doesn't run the receiver) picks it up
+void Cfg::setLibDirty(bool v) {
+  Preferences p;
+  p.begin("mypod", false);
+  p.putUChar("libdirty", v ? 1 : 0);
+  p.end();
+}
+
+bool Cfg::libDirty() {
+  Preferences p;
+  p.begin("mypod", true);
+  bool v = p.getUChar("libdirty", 0) != 0;
+  p.end();
+  return v;
+}

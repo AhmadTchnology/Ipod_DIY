@@ -210,7 +210,15 @@ static void decodeTask(void*) {
   File f;
   bool open = false;
   static uint8_t buf[1024];
+  static uint32_t lastHp = 0;                 // first-minute stack probe
   for (;;) {
+    uint32_t now = millis();
+    if (now - lastHp > 10000 && now < 90000) {
+      lastHp = now;
+      // IDF returns the high-water mark in bytes
+      Serial.printf("[dec t=%us] stack free: %u\n", now / 1000,
+                    (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    }
     Cmd c;
     bool got = xQueueReceive(cmdQ, &c, (open && !g_eof) ? 0 : pdMS_TO_TICKS(30)) == pdTRUE;
     if (got) {
@@ -228,8 +236,10 @@ static void decodeTask(void*) {
         ring.flush();
         resetResampler();
         g_frames = 0; g_base = 0; g_dur = 0; g_eof = false; g_fail = false;
+        Library::sdEnter();
         f = SD.open(c.path, FILE_READ);
         if (!f) {
+          Library::sdExit();
           g_fail = true; g_eof = true; open = false; g_loaded = true; g_switching = false;
           g_serial++;
           continue;
@@ -238,13 +248,16 @@ static void decodeTask(void*) {
         g_aEnd = f.size();
         if (g_aStart >= g_aEnd) g_aStart = 0;
         f.seek(g_aStart);
+        Library::sdExit();
         mp3->begin();
         open = true; g_loaded = true; g_switching = false;
         g_serial++;
         continue;
       }
       if (c.type == CMD_SEEK && open) {
+        Library::sdEnter();
         doSeek(f, c.frac);
+        Library::sdExit();
         g_switching = false;
         continue;
       }
@@ -253,7 +266,9 @@ static void decodeTask(void*) {
     }
     if (!open || g_eof) continue;
 
+    Library::sdEnter();                      // file reads share the bus with the UI's index lookups
     int n = f.read(buf, sizeof(buf));
+    Library::sdExit();
     if (n <= 0) { g_eof = true; continue; }
     size_t off = 0;
     while (off < (size_t)n) {
@@ -335,7 +350,7 @@ void begin() {
   cmdQ = xQueueCreate(1, sizeof(Cmd));
   mp3 = new MP3DecoderHelix(pcmCb);
   applyVolume();
-  xTaskCreatePinnedToCore(decodeTask, "mp3dec", 6144, nullptr, 3, nullptr, 0);
+  xTaskCreatePinnedToCore(decodeTask, "mp3dec", 5376, nullptr, 3, nullptr, 0);
 
   // this app only uses classic BT (A2DP); release the BLE pools (~10 KB)
   // that the BT connect below would otherwise starve on

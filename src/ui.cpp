@@ -185,6 +185,10 @@ static void cbRow(lv_event_t* e) {
 void UI::refreshLibrary() {
   int n = Library::count();
   lv_obj_set_size(libSpacer, 1, (n > 0 ? n : 1) * ROW_H);
+  // an empty spacer must not be scrollable: zero-height momentum scroll
+  // on a nearly empty container has crashed LVGL under memory pressure
+  if (n > 0) lv_obj_add_flag(libCont, LV_OBJ_FLAG_SCROLLABLE);
+  else lv_obj_clear_flag(libCont, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_scroll_to_y(libCont, 0, LV_ANIM_OFF);
   lv_label_set_text_fmt(libCount, "%d songs", n);
   if (n == 0) {

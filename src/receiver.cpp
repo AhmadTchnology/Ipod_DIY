@@ -17,6 +17,7 @@
 #include "receiver.h"
 #include "config.h"
 #include "hal.h"
+#include "settings.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WiFiClientSecure.h>
@@ -210,8 +211,7 @@ static int tgGet(WiFiClientSecure& tl, const char* url, String& body) {
 static bool saveMessage(long long chatId, long long updateId, const char* tok,
                         const char* fileId, const char* fileName);
 
-static void rxTask(void*) {
-  if (!SD.begin(SD_CS)) {
+static void rxTask(void*) {  if (!SD.begin(SD_CS)) {
     sdOk = false;
     snprintf(txtErr, sizeof(txtErr), "SD card: not found");
   } else {
@@ -296,7 +296,10 @@ static void rxTask(void*) {
       if (!fname[0]) snprintf(fname, sizeof(fname), "audio_%lld", (long long)id + 1);
       if (isAudioDoc(mime, fname)) {
         handled = saveMessage(chatId, id, c.tok, fid, fname);
-        if (handled) rxCount++;
+        if (handled) {
+          rxCount++;
+          Cfg::setLibDirty(true);          // the player rebuilds /music.idx on next boot
+        }
       } else {
         handled = true;              // not a song: skip it, advance offset
       }

@@ -28,4 +28,6 @@ namespace Cfg {
   void save();
   void saveSoon();   // debounced
   void tick();
+  void setLibDirty(bool v);  // library changed on the card -> rebuild the index
+  bool libDirty();
 }
