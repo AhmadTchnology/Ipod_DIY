@@ -67,18 +67,17 @@ Pinned dependencies (they matter — the BT audio stack breaks on newer cores):
 
 ### Vendored ESP32-A2DP patch
 
-`.pio/libdeps/cyd/ESP32-A2DP` is committed (trimmed to `src/` + metadata:
-docs/examples/.git removed) because it carries two Bluetooth-stability
-patches that a fresh `pio pkg install` would wipe:
+`lib/ESP32-A2DP` is the pschatzmann library vendored at upstream commit
+`7da8b6e` (src + metadata, docs/examples removed) and patched for
+Bluetooth stability. It is a **project-local lib** (no `lib_deps` entry),
+so PlatformIO never reinstalls or overwrites it — fresh clones of this
+repo get the patched code automatically:
 
 1. `BluetoothA2DPSource.cpp → av_hdl_stack_evt()` — the AVRCP **controller**
    init is skipped (a source-only pod never sends AVRCP commands to the
    sink); its Bluedroid allocations were starving the A2DP connect burst.
 2. The heart-beat timer start skips instead of asserting when
    `xTimerCreate` returns NULL under heap pressure.
-
-If PlatformIO ever reinstalls the library, re-apply these or copy the
-`src/` back from this repo commit.
 
 TFT pins/flags are set in `platformio.ini` via `USER_SETUP_LOADED` — no
 `TFT_eSPI_User_Setup.h` needed. Flash layout is `huge_app.csv` (the firmware
