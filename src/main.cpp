@@ -22,6 +22,12 @@ void setup() {
   Library::begin();                         // SD + scan
   Serial.printf("[heap] after library: %u\n", (unsigned)ESP.getFreeHeap());
   Player::begin();                          // decoder task + Bluetooth (allocate before LVGL grows)
+  if (S.btName[0] && !S.pairNext) {
+    // a saved device triggers the BT stack's async connect allocations; give
+    // them time to land before LVGL/UI consumes the remaining heap
+    delay(2500);
+    Serial.printf("[heap] after BT settle: %u\n", (unsigned)ESP.getFreeHeap());
+  }
   Hal::lvglInit();
   Serial.printf("[heap] after lvgl: %u\n", (unsigned)ESP.getFreeHeap());
   UI::build();

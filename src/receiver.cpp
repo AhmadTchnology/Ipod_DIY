@@ -162,6 +162,17 @@ static void pctEncode(const char* in, String& out, size_t maxIn) {
   }
 }
 
+// trim spaces/tabs/newlines from user-typed text (portal forms add some)
+static void trimTo(const char* in, char* out, size_t cap) {
+  const char* s = in;
+  const char* e = in + strnlen(in, cap * 2);
+  while (s < e && (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')) s++;
+  while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) e--;
+  size_t n = min((size_t)(e - s), cap - 1);
+  memcpy(out, s, n);
+  out[n] = '\0';
+}
+
 // case-insensitive helpers (strcasestr is not in this core's newlib)
 static bool ciEndsWith(const char* s, const char* suf) {
   size_t ls = strnlen(s, 100), lf = strnlen(suf, 20);
@@ -196,8 +207,8 @@ static int tgGet(WiFiClientSecure& tl, const char* url, String& body) {
   return code;
 }
 
-static bool saveMessage(long long updateId, const char* tok, const char* fileId,
-                        const char* fileName);
+static bool saveMessage(long long chatId, long long updateId, const char* tok,
+                        const char* fileId, const char* fileName);
 
 static void rxTask(void*) {
   if (!SD.begin(SD_CS)) {
@@ -266,6 +277,9 @@ static void rxTask(void*) {
       vTaskDelay(pdMS_TO_TICKS(2500));
       continue;
     }
+    // first "id" in the message = sender's id; in a private bot DM that IS the
+    // chat id, so the acknowledgement can be addressed without extra parsing
+    long long chatId = jsonNumVal(body, "id");
 
     // inspect the update for a document/audio attachment
     bool handled = false;
@@ -275,8 +289,13 @@ static void rxTask(void*) {
       if (p < 0) break;
       if (jsonStrVal(body, "file_name", fname, sizeof(fname), p) < 0) fname[0] = '\0';
       if (jsonStrVal(body, "mime_type", mime, sizeof(mime), p) < 0) mime[0] = '\0';
+      // audio-style sends (Telegram's music player) carry no file_name: fall
+      // back to the track title, then a numbered name so songs never collide
+      if (!fname[0] && jsonStrVal(body, "title", fname, sizeof(fname), p) < 0)
+        fname[0] = '\0';
+      if (!fname[0]) snprintf(fname, sizeof(fname), "audio_%lld", (long long)id + 1);
       if (isAudioDoc(mime, fname)) {
-        handled = saveMessage(id, c.tok, fid, fname);
+        handled = saveMessage(chatId, id, c.tok, fid, fname);
         if (handled) rxCount++;
       } else {
         handled = true;              // not a song: skip it, advance offset
@@ -297,8 +316,8 @@ static void rxTask(void*) {
   }
 }
 
-static bool saveMessage(long long updateId, const char* tok, const char* fileId,
-                        const char* fileName) {
+static bool saveMessage(long long chatId, long long updateId, const char* tok,
+                        const char* fileId, const char* fileName) {
   (void)updateId;
   WiFiClientSecure tl;
   tl.setInsecure();
@@ -375,16 +394,23 @@ static bool saveMessage(long long updateId, const char* tok, const char* fileId,
   snprintf(txtErr, sizeof(txtErr), "saved %s", sane);
   Serial.printf("[RX] saved %s (%d bytes)\n", finalPath, wr);
 
-  // 4. acknowledge in the chat so the user sees it landed
-  WiFiClientSecure tl2;
-  tl2.setInsecure();
-  String enc;
-  pctEncode(finalPath + 1, enc, 120);       // keep / out of the text? fine as %2F
-  String aurl = "https://api.telegram.org/bot";
-  aurl += tok;
-  aurl += "/sendMessage?text=" + enc;
-  String junk;
-  tgGet(tl2, aurl.c_str(), junk);
+  // 4. acknowledge in the chat so the user sees it landed (needs chat_id!)
+  if (chatId > 0) {
+    WiFiClientSecure tl2;
+    tl2.setInsecure();
+    String text = "Saved to MyPod: ";
+    text += sane;
+    String enc;
+    pctEncode(text.c_str(), enc, 140);
+    String aurl = "https://api.telegram.org/bot";
+    aurl += tok;
+    aurl += "/sendMessage?chat_id=";
+    aurl += String((long long)chatId);
+    aurl += "&text=";
+    aurl += enc;
+    String junk;
+    tgGet(tl2, aurl.c_str(), junk);
+  }
   return true;
 }
 
@@ -424,9 +450,12 @@ static void hRoot() {
 static void hSave() {
   if (server.hasArg("ssid") && server.hasArg("tok") && server.arg("ssid").length() > 0 &&
       server.arg("tok").length() > 0) {
-    strlcpy(creds.ssid, server.arg("ssid").c_str(), sizeof(creds.ssid));
-    strlcpy(creds.pass, server.hasArg("pass") ? server.arg("pass").c_str() : "", sizeof(creds.pass));
-    strlcpy(creds.tok, server.arg("tok").c_str(), sizeof(creds.tok));
+    trimTo(server.arg("ssid").c_str(), creds.ssid, sizeof(creds.ssid));
+    if (server.hasArg("pass")) trimTo(server.arg("pass").c_str(), creds.pass, sizeof(creds.pass));
+    else creds.pass[0] = '\0';
+    char tokIn[64];
+    trimTo(server.arg("tok").c_str(), tokIn, sizeof(tokIn));
+    strlcpy(creds.tok, tokIn, sizeof(creds.tok));
     creds.magic = RX_MAGIC;
     credsStore();
   }
