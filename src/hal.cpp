@@ -17,10 +17,12 @@ static uint32_t lastTouch = 0, lastActive = 0;
 static int curPct = 0;
 static float ldrAvg = -1;
 
+static const int DRAW_ROWS = 4;      // steps: 16 -> 8 -> 6 -> 4 rows, reclaiming
+                                     // RAM for the Bluetooth stack (see README)
 static lv_disp_draw_buf_t drawBuf;
-static lv_color_t buf1[SCR_W * 4];   // 2x4-row draw buffers (steps: 16 -> 8 -> 6
-static lv_color_t buf2[SCR_W * 4];   // -> 4 rows, reclaiming RAM for the Bluetooth
-static lv_disp_drv_t dispDrv;        // stack — see README troubleshooting)
+static lv_color_t buf1[SCR_W * DRAW_ROWS];
+static lv_color_t buf2[SCR_W * DRAW_ROWS];
+static lv_disp_drv_t dispDrv;
 static lv_indev_drv_t indevDrv;
 static lv_disp_t* disp = nullptr;
 
@@ -104,7 +106,7 @@ void earlyInit() {
 
 void lvglInit() {
   lv_init();
-  lv_disp_draw_buf_init(&drawBuf, buf1, buf2, SCR_W * 8);
+  lv_disp_draw_buf_init(&drawBuf, buf1, buf2, SCR_W * DRAW_ROWS);
   lv_disp_drv_init(&dispDrv);
   dispDrv.hor_res = SCR_W;
   dispDrv.ver_res = SCR_H;
