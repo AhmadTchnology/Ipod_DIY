@@ -212,11 +212,19 @@ bool Library::started() { return libStarted; }
 
 bool Library::start() {                       // called lazily: first play / library view
   if (libStarted) return sdReady;
+  // Bluetooth init owns the heap for its first seconds: the SD mount and the
+  // index load allocate tens of KB and must not race bluedroid's startup.
+  while (g_btIniting) vTaskDelay(pdMS_TO_TICKS(20));
   libStarted = true;
   sdMx = xSemaphoreCreateMutex();
+  Serial.printf("[lib] pre-spi free=%u\n", (unsigned)ESP.getFreeHeap());
+  uint32_t preSd = ESP.getFreeHeap();
   sdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  Serial.printf("[lib] pre-sd free=%u\n", (unsigned)ESP.getFreeHeap());
   sdReady = SD.begin(SD_CS, sdSpi, 20000000);
-  Serial.printf("SD: %s\n", sdReady ? "ok" : "not found");
+  Serial.printf("[lib] SD=%d free=%u (mount cost %u)\n", (int)sdReady,
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)(preSd - ESP.getFreeHeap()));
   if (!sdReady) return false;
   bool rebuild = Cfg::libDirty();            // receiver downloaded new files
   if (!rebuild) rebuild = !loadIdx();        // no (or broken/stale-format) index
@@ -228,6 +236,8 @@ bool Library::start() {                       // called lazily: first play / lib
     Serial.println("Library: building /music.idx (scanning card) ...");
     rescan();                                // stop playback first (UI does that)
   }
+  Serial.printf("[lib] ready: n=%d free=%u\n", (int)nTracks,
+                (unsigned)ESP.getFreeHeap());
   return true;
 }
 

@@ -10,6 +10,12 @@
 
 using namespace libhelix;
 
+// The Bluetooth-start gate (see config.h). Set in ensureBt() before the starter
+// task exists, cleared as soon as bluedroid is up - everything allocation-
+// heavy elsewhere waits on this. Global scope on purpose: library.cpp and
+// ui.cpp wait on it.
+volatile unsigned char g_btIniting = 0;
+
 // ---------------------------------------------------------------- ring buffer
 struct Ring {
   uint8_t* b = nullptr;
@@ -200,9 +206,10 @@ static uint32_t id3Parse(File& f) {
 static void doSeek(File& f, float frac) {
   uint32_t pos = g_aStart + (uint32_t)(frac * (float)(g_aEnd - g_aStart));
   f.seek(pos);
-  // no mp3->end()/begin() here: re-allocating helix's buffers after
-  // Bluetooth has fragmented the heap fails and kills the decoder task.
-  // The decoder re-syncs on the next sync word by itself.
+  // discard the partially buffered old-position frame: softReset touches no
+  // allocation (end()/begin() here would wedge on the fragmented heap) and
+  // the decoder resyncs on the next sync word by itself.
+  mp3->softReset();
   resetResampler();
   ring.flush();
   g_base = g_dur ? frac * g_dur : 0;
@@ -234,12 +241,16 @@ static void decodeTask(void*) {
         continue;
       }
       if (c.type == CMD_OPEN) {
+        // SD work waits for the Bluetooth start gate: opening a file allocates
+        // FATFS/VFS buffers and must not race bluedroid's startup allocations
+        while (g_btIniting) vTaskDelay(pdMS_TO_TICKS(20));
         if (!*mp3) {                 // helix buffers never allocated: fail soft
           g_fail = true; g_eof = true; g_loaded = true; g_switching = false;
           g_serial++;
           continue;
         }
         if (f) f.close();
+        mp3->softReset();            // clear stale frame data; no allocations
         ring.flush();
         resetResampler();
         g_frames = 0; g_base = 0; g_dur = 0; g_eof = false; g_fail = false;
@@ -367,33 +378,50 @@ void prealloc() {
   // Bluetooth needs ~88 KB when it starts and afterwards fragments the heap
   // so the largest block never fits helix's buffers again (play then wedged
   // the decoder task). At boot there is plenty for both. The buffers are
-  // NEVER freed — they stay pinned so later allocations flow around them.
+  // NEVER freed - they stay pinned so later allocations flow around them.
+  Serial.printf("[dec] pre-helix free=%u largest=%u\n", (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   mp3 = new MP3DecoderHelix(pcmCb);
-  mp3->setMaxFrameSize(1536);            // biggest MP3 frame is 1441 bytes
-  mp3->setMaxPCMSize(4608);              // 1152 samples x 2ch x 2 bytes
+  // stock buffer sizes: frame 2048 (max MP3 frame 1441 + margin), pcm 5120
   if (!mp3->begin()) Serial.println("[dec] helix alloc FAILED!");
-  Serial.printf("[dec] helix buffers pinned, heap=%u\n",
-                (unsigned)ESP.getFreeHeap());
+  Serial.printf("[dec] helix buffers pinned, heap=%u largest=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
 void begin() {
   if (!ring.init(RING_BYTES)) Serial.println("PCM ring alloc failed!");
   cmdQ = xQueueCreate(1, sizeof(Cmd));
   applyVolume();
-  xTaskCreatePinnedToCore(decodeTask, "mp3dec", 3072, nullptr, 3, nullptr, 0);
+  // 3072 overflowed during deep decode (helix synth + printf); HWM probe
+  // below must stay > ~800 at play
+  xTaskCreatePinnedToCore(decodeTask, "mp3dec", 5120, nullptr, 3, nullptr, 0);
 }
 
 // Bluetooth starts on the FIRST PLAY, not at boot: the stack permanently
 // holds ~88 KB and its connect step needs ~105+ KB free to survive. At boot
 // the decoder's pinned buffers + the UI leave too little; by play time the
 // order is: BT first (plenty of headroom), then the SD card.
+//
+// MyPod: the whole start sequence runs on its OWN task. Controller enable has
+// been observed hanging inside the LVGL task, which froze the whole UI with
+// nothing on the console. The task weakens any such stall to "Bluetooth never
+// comes up" while the UI, decoder and SD keep working.
 static bool btUp = false;
-void ensureBt() {
-  if (btUp) return;
-  btUp = true;
-  // this app only uses classic BT (A2DP); release the BLE pools (~10 KB)
-  esp_bt_mem_release(ESP_BT_MODE_BLE);
+static volatile bool btReturn = false;
+static void btStarterTask(void*) {
+  // Do NOT call esp_bt_mem_release(ESP_BT_MODE_BLE) here. The Arduino sdkconfig
+  // builds the controller in BTDM (Classic+BLE) mode; Arduino's btStart() inits
+  // and enables it as BTDM, which needs the BLE sub-mode's memory. Releasing it
+  // first left the controller's internals broken and bluedroid's very first
+  // allocations failed (malloc(304)=NULL => memset(NULL) StoreProhibited in
+  // bta_sys_init), on every boot, no matter how much heap was free.
+  Serial.printf("[bt] largest free block: %u\n",
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  bool integ = heap_caps_check_integrity(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, true);
+  Serial.printf("[bt] heap integrity: %s\n", integ ? "OK" : "CORRUPT!");
   Serial.printf("[heap] before a2dp: %u\n", (unsigned)ESP.getFreeHeap());
+  Serial.printf("[bt] auto='%s' pairNext=%d\n", S.btName, (int)S.pairNext);
   int h = (int)ESP.getFreeHeap();
   for (int tries = 0; h < 24000 && tries < 60; tries++) {
     vTaskDelay(pdMS_TO_TICKS(250));
@@ -409,7 +437,24 @@ void ensureBt() {
   } else {
     a2dp.start(S.btName);
   }
+  g_btIniting = 0;      // bluedroid is up: release the SD / page-build gate
   Serial.printf("[heap] after a2dp.start: %u\n", (unsigned)ESP.getFreeHeap());
+  Serial.printf("[bt] starter stack HWM: %u words\n",
+                (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+  btReturn = true;
+  vTaskDelete(nullptr);
+}
+
+void ensureBt() {
+  if (btUp) return;
+  btUp = true;
+  g_btIniting = 1;
+  if (xTaskCreatePinnedToCore(btStarterTask, "btstart", 16384, nullptr, 2,
+                              nullptr, 1) != pdPASS) {
+    Serial.println("[bt] starter task failed!");
+    btUp = false;
+    g_btIniting = 0;
+  }
 }
 
 bool btStarted() { return btUp; }

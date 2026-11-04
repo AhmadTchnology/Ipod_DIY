@@ -95,6 +95,9 @@ class MP3DecoderHelix : public CommonHelix {
 
   /// Allocate the decoder
   virtual bool allocateDecoder() override {
+    // MyPod: buffers are allocated exactly once (at boot via Player::prealloc)
+    // and live for the whole session; repeated begin() calls must not
+    // re-allocate — Bluetooth has fragmented the heap by then.
     if (decoder == nullptr) {
       decoder = MP3InitDecoder();
     }
@@ -138,7 +141,9 @@ class MP3DecoderHelix : public CommonHelix {
   // return the resulting PCM data
   void provideResult(MP3FrameInfo &info) {
     // increase PCM size if this fails
-    assert(info.outputSamps * sizeof(short) < maxPCMSize());
+    // MyPod: was `< maxPCMSize()` — a full 1152-sample stereo frame is
+    // exactly 4608 bytes, so the strict compare fired the assert on normal CDs
+    assert(info.outputSamps * sizeof(short) <= maxPCMSize());
 
     LOGD_HELIX( "=> provideResult: %d", info.outputSamps);
     if (info.outputSamps > 0) {

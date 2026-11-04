@@ -92,6 +92,15 @@ class CommonHelix {
   /// returns true if active
   operator bool() { return active; }
 
+  /// MyPod: clears buffered frame data w/o touching any allocation.
+  /// Used between tracks / on seek: safe after Bluetooth has fragmented
+  /// the heap, unlike begin()/end().
+  void softReset() {
+    frame_buffer.reset();
+    frame_counter = 0;
+    parse_0_count = 0;
+  }
+
 #ifdef ARDUINO
   /// Provides the timestamp in ms of last write
   uint64_t timeOfLastWrite() { return time_last_write; }

@@ -31,6 +31,7 @@ static void showPage(int p);                    // defined at the bottom
 static int curPage = -1;
 static int prevPage = PAGE_NOW;
 static lv_obj_t* pageObj = nullptr;
+static void updNext();                          // Now page "Next Track:" row (defined below)
 
 // ------------------------------------------------------------------ state
 struct Row { lv_obj_t *obj, *title, *sub, *icon; int idx; };
@@ -43,7 +44,7 @@ static Row rows[POOL];
 static lv_obj_t *tabNow = nullptr, *tabSet = nullptr;
 // now playing
 static lv_obj_t *npArt, *npTitle, *npArtist, *npSeek, *npEl, *npRem, *npBt;
-static lv_obj_t *npPlay, *npPlayLbl, *npShufLbl, *npVol;
+static lv_obj_t *npPlay, *npPlayLbl, *npShufLbl, *npVol, *npVolPct, *npUpNext;
 // settings
 static lv_obj_t *setBtLbl, *setInfo, *lblBright, *lblLimit;
 // picker overlay
@@ -176,8 +177,11 @@ static void cbRow(lv_event_t* e) {
   int slot = (int)(intptr_t)lv_event_get_user_data(e);
   int idx = rows[slot].idx;
   if (idx < 0) return;
+  Player::ensureBt();                          // lazy Bluetooth start first: its
+                                               // start spike needs memory, so run
+                                               // it before anything else eats into
+                                               // the currently-free heap
   if (!Library::start()) return;               // lazy SD mount
-  Player::ensureBt();                          // lazy Bluetooth start (non-blocking)
   if (!(idx == Player::current() && Player::loaded())) Player::play(idx);
   showPage(PAGE_NOW);
 }
@@ -261,13 +265,13 @@ static void buildLibrary() {
 
 // ------------------------------------------------------------------ now playing page
 static void cbPlay(lv_event_t*) {
+  Player::ensureBt();                          // order like cbRow: BT spike first
   if (!Library::start()) return;
-  Player::ensureBt();
   Player::toggle();
 }
 static void cbNext(lv_event_t*) { Player::next(); }
 static void cbPrev(lv_event_t*) { Player::prev(); }
-static void cbShuf(lv_event_t*) { Player::setShuffle(!S.shuffle); }
+static void cbShuf(lv_event_t*) { Player::setShuffle(!S.shuffle); updNext(); }
 static void cbArt(lv_event_t*)  { cbPlay(nullptr); }
 
 static void cbSeek(lv_event_t* e) {
@@ -296,25 +300,27 @@ static void styleBars(lv_obj_t* s) {
 static void buildNowPlaying() {
   lv_obj_clear_flag(tabNow, LV_OBJ_FLAG_SCROLLABLE);
 
-  // top bar: back | MyPod | bt state | settings
+  // -------- top row: back | bt state | volume % | settings
+  // (the mockup's clock/battery row; there is no battery sense on the CYD,
+  //  so that slot shows the volume %, under the volume bar it belongs to)
   lv_obj_t* back = mkBtn(tabNow, LV_SYMBOL_LEFT, &lv_font_montserrat_14, 26, 20, C_TEXT,
                          [](lv_event_t*){ showPage(PAGE_LIB); });
-  lv_obj_set_pos(back, 2, 0);
-  mkLabel(tabNow, "MyPod", C_PIX, C_DIM);
-  lv_obj_set_pos(lv_obj_get_child(tabNow, lv_obj_get_child_cnt(tabNow) - 1), 34, 1);
+  lv_obj_set_pos(back, 0, 0);
   npBt = mkLabel(tabNow, "", C_PIX, C_DIM);
-  lv_obj_align(npBt, LV_ALIGN_TOP_RIGHT, -32, 1);
-  lv_obj_t* gear = mkBtn(tabNow, LV_SYMBOL_SETTINGS, &lv_font_montserrat_14, 26, 20, C_TEXT,
+  lv_obj_set_pos(npBt, 32, 6);
+  npVolPct = mkLabel(tabNow, "", C_PIX, C_DIM);
+  lv_obj_set_pos(npVolPct, 166, 6);
+  lv_obj_t* gear = mkBtn(tabNow, LV_SYMBOL_SETTINGS, &lv_font_montserrat_14, 24, 20, C_TEXT,
                          [](lv_event_t*){ showPage(PAGE_SET); });
   lv_obj_align(gear, LV_ALIGN_TOP_RIGHT, 0, 0);
 
-  // album art frame (white border, like the reference)
+  // -------- album art: the mockup's big square (touch = play/pause)
   npArt = lv_obj_create(tabNow);
   lv_obj_remove_style_all(npArt);
-  lv_obj_set_size(npArt, 272, 130);
-  lv_obj_set_pos(npArt, 14, 22);
-  lv_obj_set_style_border_width(npArt, 2, 0);
-  lv_obj_set_style_border_color(npArt, C_TEXT, 0);
+  lv_obj_set_size(npArt, 184, 184);
+  lv_obj_set_pos(npArt, 20, 20);
+  lv_obj_set_style_border_width(npArt, 1, 0);
+  lv_obj_set_style_border_color(npArt, C_SURF2, 0);
   lv_obj_set_style_bg_color(npArt, C_SURF, 0);
   lv_obj_set_style_bg_opa(npArt, LV_OPA_COVER, 0);
   lv_obj_clear_flag(npArt, LV_OBJ_FLAG_SCROLLABLE);
@@ -323,53 +329,89 @@ static void buildNowPlaying() {
   lv_obj_set_style_text_opa(ic, LV_OPA_60, 0);
   lv_obj_center(ic);
 
-  // volume: the green bar on the right edge (drag to set)
+  // -------- right-edge volume bar (mockup rect 225,20 ~ 10x200; the slider
+  // goes vertical automatically when its height > its width)
   npVol = lv_slider_create(tabNow);
   lv_slider_set_range(npVol, 0, 100);
   lv_slider_set_value(npVol, S.volume, LV_ANIM_OFF);
-  lv_obj_set_size(npVol, 14, 130);
-  lv_obj_set_pos(npVol, 300, 22);
+  lv_obj_set_size(npVol, 10, 184);
+  lv_obj_set_pos(npVol, 225, 20);
   styleBars(npVol);
   lv_obj_add_event_cb(npVol, cbVol, LV_EVENT_VALUE_CHANGED, NULL);
 
-  // title + artist (pixel font)
+  // -------- title / artist
   npTitle = mkLabel(tabNow, "Not playing", C_PIX, C_TEXT);
-  lv_obj_set_width(npTitle, 292);
+  lv_obj_set_width(npTitle, 200);
   lv_label_set_long_mode(npTitle, LV_LABEL_LONG_SCROLL_CIRCULAR);
-  lv_obj_set_pos(npTitle, 14, 156);
+  lv_obj_set_pos(npTitle, 20, 228);
 
-  npArtist = mkLabel(tabNow, "Tap play to load music", C_PIX, C_DIM);
-  lv_obj_set_width(npArtist, 292);
+  npArtist = mkLabel(tabNow, "Tap play to load music", &lv_font_montserrat_12, C_DIM);
+  lv_obj_set_width(npArtist, 200);
   lv_label_set_long_mode(npArtist, LV_LABEL_LONG_DOT);
-  lv_obj_set_pos(npArtist, 14, 174);
+  lv_obj_set_pos(npArtist, 20, 249);
 
-  // progress
+  // -------- progress bar (mockup rect 20,263 200x10, nudged down to clear
+  // the artist line's 16px font)
   npSeek = lv_slider_create(tabNow);
   lv_slider_set_range(npSeek, 0, 1000);
-  lv_obj_set_size(npSeek, 292, 8);
-  lv_obj_set_pos(npSeek, 14, 193);
+  lv_obj_set_size(npSeek, 200, 10);
+  lv_obj_set_pos(npSeek, 20, 265);
   styleBars(npSeek);
   lv_obj_add_event_cb(npSeek, cbSeek, LV_EVENT_RELEASED, NULL);
 
-  // times: elapsed left, total right (like the reference)
-  npEl = mkLabel(tabNow, "0:00", C_PIX, C_TEXT);
-  lv_obj_set_pos(npEl, 14, 204);
-  npRem = mkLabel(tabNow, "0:00", C_PIX, C_TEXT);
-  lv_obj_align(npRem, LV_ALIGN_TOP_RIGHT, -14, 204);
-
-  // transport: prev / play / next
-  lv_obj_t* pv = mkBtn(tabNow, LV_SYMBOL_PREV, &lv_font_montserrat_14, 36, 22, C_TEXT, cbPrev);
-  lv_obj_set_pos(pv, 86, 218);
-  npPlay = mkBtn(tabNow, LV_SYMBOL_PLAY, &lv_font_montserrat_14, 48, 22, C_ACC, cbPlay);
-  lv_obj_set_pos(npPlay, 136, 218);
+  // -------- elapsed / play state / duration, one line like the mockup
+  npEl = mkLabel(tabNow, "0:00", &lv_font_montserrat_12, C_TEXT);
+  lv_obj_set_pos(npEl, 20, 279);
+  npRem = mkLabel(tabNow, "0:00", &lv_font_montserrat_12, C_TEXT);
+  lv_obj_align(npRem, LV_ALIGN_TOP_RIGHT, -20, 279);
+  npPlay = mkBtn(tabNow, LV_SYMBOL_PLAY, &lv_font_montserrat_16, 16, 18, C_TEXT, cbPlay);
+  lv_obj_set_pos(npPlay, 112, 277);        // mockup icon: 14x18 centred at 113
   npPlayLbl = lv_obj_get_child(npPlay, 0);
-  lv_obj_t* nx = mkBtn(tabNow, LV_SYMBOL_NEXT, &lv_font_montserrat_14, 36, 22, C_TEXT, cbNext);
-  lv_obj_set_pos(nx, 200, 218);
 
-  // shuffle text (green when on)
-  lv_obj_t* sh = mkBtn(tabNow, "Shuffle", C_PIX, 62, 22, C_DIM, cbShuf);
-  lv_obj_align(sh, LV_ALIGN_TOP_RIGHT, -14, 218);
+  // invisible taps flanking the icon = prev / next
+  lv_obj_t* pvz = lv_obj_create(tabNow);
+  lv_obj_remove_style_all(pvz);
+  lv_obj_set_size(pvz, 36, 18);
+  lv_obj_set_pos(pvz, 68, 277);
+  lv_obj_add_event_cb(pvz, cbPrev, LV_EVENT_CLICKED, NULL);
+  lv_obj_t* nxz = lv_obj_create(tabNow);
+  lv_obj_remove_style_all(nxz);
+  lv_obj_set_size(nxz, 36, 18);
+  lv_obj_set_pos(nxz, 136, 277);
+  lv_obj_add_event_cb(nxz, cbNext, LV_EVENT_CLICKED, NULL);
+
+  // -------- shuffle toggle (mockup's PlayBackState text)
+  lv_obj_t* sh = mkBtn(tabNow, "Shuffle", &lv_font_montserrat_12, 64, 13, C_DIM, cbShuf);
+  lv_obj_set_pos(sh, 20, 293);
   npShufLbl = lv_obj_get_child(sh, 0);
+
+  // -------- queue row (mockup: "Next Track:" + the upcoming song)
+  mkLabel(tabNow, "Next Track:", &lv_font_montserrat_12, C_DIM);
+  lv_obj_set_pos(lv_obj_get_child(tabNow, lv_obj_get_child_cnt(tabNow) - 1), 20, 308);
+  npUpNext = mkLabel(tabNow, "", &lv_font_montserrat_12, C_TEXT);
+  lv_obj_set_pos(npUpNext, 88, 308);
+  lv_obj_set_width(npUpNext, 132);
+  lv_label_set_long_mode(npUpNext, LV_LABEL_LONG_DOT);
+
+  updNext();                               // fill the mockup's queue row
+}
+
+// queue prediction for the mockup's "Next Track:" row; shuffle is random in
+// the player, so it can only be shown as "(shuffle)"
+static void updNext() {
+  if (curPage != PAGE_NOW || !npUpNext) return;
+  if (!Player::loaded()) { lv_label_set_text(npUpNext, "-"); return; }
+  int n = Library::count();
+  if (S.shuffle && n > 1) {
+    lv_label_set_text(npUpNext, "(shuffle)");
+  } else if (n > 1) {
+    int nxt = (Player::current() + 1) % n;
+    char t[64], a[2]; a[0] = 0;
+    Library::displayName(nxt, t, sizeof(t), a, sizeof(a));
+    lv_label_set_text(npUpNext, t);
+  } else {
+    lv_label_set_text(npUpNext, "-");
+  }
 }
 
 static void onTrackChanged() {
@@ -387,10 +429,16 @@ static void onTrackChanged() {
   popIn(npTitle);
   popIn(npArtist);
   popIn(npArt);
+  updNext();
 }
 
 // ------------------------------------------------------------------ settings page
 static lv_obj_t* setCard(const char* title) {
+  {                                              // pool tracker: per-card budget
+    lv_mem_monitor_t pm; lv_mem_monitor(&pm);
+    Serial.printf("[ui] s-card %-13s free=%u frag=%u%%\n", title,
+                  (unsigned)pm.free_size, (unsigned)pm.frag_pct);
+  }
   lv_obj_t* h = mkLabel(tabSet, title, &lv_font_montserrat_12, C_DIM);
   lv_obj_set_style_pad_left(h, 4, 0);
   lv_obj_t* c = lv_obj_create(tabSet);
@@ -596,6 +644,8 @@ static void cbRecal(lv_event_t*) {
 }
 
 static void buildSettings() {
+  Serial.printf("[ui] bs: enter\n");
+  lv_obj_add_flag(tabSet, LV_OBJ_FLAG_SCROLLABLE);   // installPage cleared it
   lv_obj_set_scroll_dir(tabSet, LV_DIR_VER);
   lv_obj_set_scrollbar_mode(tabSet, LV_SCROLLBAR_MODE_ACTIVE);
   lv_obj_set_style_pad_all(tabSet, 10, 0);
@@ -605,8 +655,10 @@ static void buildSettings() {
   lv_obj_t* back = mkBtn(tabSet, LV_SYMBOL_LEFT, &lv_font_montserrat_14, 26, 20, C_TEXT,
                          [](lv_event_t*){ showPage(prevPage); });
   lv_obj_set_pos(back, -4, 0);
+  Serial.printf("[ui] bs: back ok\n");
   lv_obj_t* hdr = mkLabel(tabSet, "Settings", &lv_font_montserrat_20, C_TEXT);
   lv_obj_set_style_pad_left(hdr, 4, 0);
+  Serial.printf("[ui] bs: hdr ok\n");
 
   lv_obj_t* c = setCard("THEME");
   setRow(c, "Look");                                // label row, chips below
@@ -669,7 +721,7 @@ static void buildSettings() {
 
   c = setCard("WIFI RECEIVER");
   swWifi = addSwitch(c, "WiFi receiver", Receiver::enabled(), cbWifi);
-  lv_obj_t* wi = mkLabel(c, "Hotspot portal for your phone: enter home WiFi + Telegram bot token. Songs the bot receives go to the SD card (/music/telegram).", &lv_font_montserrat_12, C_DIM);
+  lv_obj_t* wi = mkLabel(c, "Phone joins the pod's WiFi; the Telegram bot saves songs to /music/telegram.", &lv_font_montserrat_12, C_DIM);
   lv_obj_set_width(wi, LV_PCT(100));
   lv_label_set_long_mode(wi, LV_LABEL_LONG_WRAP);
 
@@ -717,6 +769,7 @@ static void cbPick(lv_event_t* e) {
 }
 
 static void showPicker() {
+  while (g_btIniting) vTaskDelay(pdMS_TO_TICKS(20));   // build after BT init owns the heap
   if (pickPanel) return;
   pickPanel = lv_obj_create(lv_layer_top());
   lv_obj_remove_style_all(pickPanel);
@@ -780,24 +833,13 @@ static void uiTick(lv_timer_t*) {
       else lv_label_set_text(npRem, "0:00");
     }
 
-    // the artist line alternates with the upcoming track, like the reference
-    static uint32_t lastFlip = 0;
-    static bool showNext = false;
-    static char artistBuf[48] = "";
-    if (Player::loaded() && millis() - lastFlip > 4000) {
-      lastFlip = millis();
-      showNext = !showNext;
-      if (showNext) {
-        int n = Library::count();
-        if (n > 1) {
-          int nxt = (Player::current() + 1) % n;
-          char t[64], a[48];
-          Library::displayName(nxt, t, sizeof(t), a, sizeof(a));
-          lv_label_set_text_fmt(npArtist, "Next: %s", t);
-        }
-      } else {
-        lv_label_set_text(npArtist, artistBuf[0] ? artistBuf : "Unknown artist");
-      }
+    // volume % sits where the mockup had its battery level
+    static int lastVolPct = -1;
+    if (S.volume != lastVolPct) {
+      lastVolPct = S.volume;
+      char b[8];
+      snprintf(b, sizeof(b), "%d%%", S.volume);
+      lv_label_set_text(npVolPct, b);
     }
 
     bool conn = Player::btConnected();
@@ -845,20 +887,55 @@ static void buildPage(int p) {
   else { tabSet = pageObj; buildSettings(); }
 }
 
-static void showPage(int p) {
-  if (curPage == p) return;
-  if (p == PAGE_SET) prevPage = curPage;        // Settings returns to where it came from
+// pages -------------------------------------------------------------------------- pages
+// MyPod: page switches are deferred via lv_async_call. Deleting the current
+// page inside one of its own (touch) event handlers free-walks the tree while
+// LVGL's input device state still references it -> use-after-free panics
+// (lv_btn_create -> lv_obj_mark_layout_as_dirty on garbage, EXCVADDR 0x22).
+// The async callback runs after the input event cycle is fully finished.
+static void installPage(void* p) {
+  int pg = (int)(intptr_t)p;
+  // Bluetooth init owns the heap for its first seconds: page builds churn the
+  // LVGL pool and occasionally the main heap, so wait the ~2-3 s out (the UI
+  // freezes briefly - acceptable next to a reboot).
+  while (g_btIniting) vTaskDelay(pdMS_TO_TICKS(20));
+  Serial.printf("[ui] install page %d (cur=%d) heap=%u\n", pg, curPage,
+                (unsigned)ESP.getFreeHeap());
   if (pageObj) {
     if (curPage == PAGE_NOW) setBreathing(false);   // stop anims before the widgets die
     lv_obj_del(pageObj);
     pageObj = nullptr;
+    Serial.printf("[ui] old page deleted heap=%u\n", (unsigned)ESP.getFreeHeap());
   }
-  curPage = p;
+  curPage = pg;
   pageObj = lv_obj_create(lv_scr_act());
+  if (!pageObj) {                                // pool too small even for the page root
+    Serial.printf("[ui] CRITICAL: page root alloc failed (pool exhausted)\n");
+    return;
+  }
+  Serial.printf("[ui] page root ok\n");
   lv_obj_remove_style_all(pageObj);
   lv_obj_set_size(pageObj, SCR_W, SCR_H);
   lv_obj_clear_flag(pageObj, LV_OBJ_FLAG_SCROLLABLE);
-  buildPage(p);
+  {
+    lv_mem_monitor_t pre;                        // warn early if the pool runs tight
+    lv_mem_monitor(&pre);
+    if (pre.free_size < 9000)
+      Serial.printf("[ui] WARN pool tight: free=%u frag=%u%% (before page %d build)\n",
+                    (unsigned)pre.free_size, (unsigned)pre.frag_pct, pg);
+  }
+  buildPage(pg);
+  lv_mem_monitor_t m;                          // probe: page build cost
+  lv_mem_monitor(&m);
+  Serial.printf("[ui] page %d built: lvgl free=%u maxused=%u frag=%u%% heap=%u\n", pg,
+                (unsigned)m.free_size, (unsigned)m.max_used, (unsigned)m.frag_pct,
+                (unsigned)ESP.getFreeHeap());
+}
+
+static void showPage(int p) {
+  if (curPage == p) return;
+  if (p == PAGE_SET) prevPage = curPage;        // Settings returns to where it came from
+  lv_async_call(installPage, (void*)(intptr_t)p);
 }
 
 // ------------------------------------------------------------------ API

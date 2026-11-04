@@ -113,7 +113,15 @@ class AllocatorExt : public Allocator {
 #  endif
 #endif
     if (result == nullptr) result = malloc(size);
-    // MyPod patch: no while(true) hang on failure — report nullptr instead
+    if (result == nullptr) {
+      // MyPod patch: no while(true) hang on failure — report nullptr instead
+      LOGE_HELIX("alloc of %u bytes failed", (unsigned)size);
+      return nullptr;
+    }
+    memset(result, 0, size);           // helix expects calloc-style zeroing
+    static unsigned int hx_count = 0;
+    hx_count++;
+    Serial.printf("[HXa#%u] %u -> %p\n", hx_count, (unsigned)size, result);
     return result;
   }
 };

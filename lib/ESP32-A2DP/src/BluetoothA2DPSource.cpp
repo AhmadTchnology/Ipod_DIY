@@ -14,6 +14,8 @@
 // Copyright 2015-2016 Espressif Systems (Shanghai) PTE LTD
 
 #include "BluetoothA2DPSource.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #if IS_VALID_PLATFORM
 
@@ -145,12 +147,21 @@ void BluetoothA2DPSource::start(std::vector<const char *> names) {
     ESP_LOGE(BT_AV_TAG, "Failed to initialize controller");
     return;
   }
+  ESP_LOGI(BT_AV_TAG, "bt_start ok, bluedroid_init next");
+  {
+    bool ok = heap_caps_check_integrity(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, true);
+    ESP_LOGI(BT_AV_TAG, "heap integrity after controller: %s", ok ? "OK" : "CORRUPT!");
+    ESP_LOGI(BT_AV_TAG, "btstart stack HWM: %u words",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+  }
 
   esp_bluedroid_status_t bluedroid_state = esp_bluedroid_get_status();
   ESP_LOGI(BT_AV_TAG, "Bluedroid status: %d", bluedroid_state);
 
   if (bluedroid_state == ESP_BLUEDROID_STATUS_UNINITIALIZED) {
-    if (bluedroid_init() != ESP_OK) {
+    esp_err_t bi = bluedroid_init();
+    ESP_LOGI(BT_AV_TAG, "bluedroid_init=%d %s", (int)bi, esp_err_to_name(bi));
+    if (bi != ESP_OK) {
       ESP_LOGE(BT_AV_TAG, "%s initialize bluedroid failed\n", __func__);
       return;
     }

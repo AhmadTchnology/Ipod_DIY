@@ -35,3 +35,11 @@
 
 // Optional: hard-code your headphones' Bluetooth name (otherwise pair in the UI)
 #define DEFAULT_BT_NAME ""
+
+// ---- Bluetooth start gate ----------------------------------------------
+// 1 while the Bluetooth stack is coming up (controller init + bluedroid +
+// stack-up, ~2-3 s). Allocation-heavy paths (SD mount, index load, page
+// rebuilds, file open) must wait while it is set: bluedroid's init has no
+// failure recovery - a failed allocation becomes a memset(NULL) StoreProhibited
+// that reboots the whole board. Defined in player.cpp.
+extern volatile unsigned char g_btIniting;
