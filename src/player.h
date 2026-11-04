@@ -1,0 +1,38 @@
+#pragma once
+#include <Arduino.h>
+
+namespace Player {
+  void begin();                 // PCM ring + decoder task + Bluetooth A2DP source
+  void finishInit();            // allocate the MP3 decoder buffers (once, after BT settled)
+  bool decoderOk();             // false -> not enough RAM for the decoder
+  const char* error();          // last user-visible error ("" = none); cleared on read
+  void update();                // call from loop(): track-end handling
+  void play(int idx);
+  void toggle();
+  void next();
+  void prev();
+  void stop();
+  void seek(float frac);        // 0..1
+
+  bool active();                // audio is actually playing
+  bool paused();
+  bool loaded();
+  int  current();
+  uint32_t serial();            // changes whenever a new track starts
+  float position();             // seconds
+  uint32_t duration();          // seconds (estimated from bitrate), 0 = unknown
+  float fraction();
+
+  int  nextIndex();             // index of the track that follows, -1 = unknown (shuffle)
+
+  void setVolume(uint8_t v);
+  uint8_t volume();
+  void setShuffle(bool on);
+  void setRepeat(uint8_t mode); // 0 off, 1 all, 2 one
+  void meta(char* title, size_t tn, char* artist, size_t an);
+
+  bool btConnected();
+  bool scanMode();              // true while picking headphones
+  int  scanCount();
+  const char* scanName(int i);
+}
