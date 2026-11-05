@@ -18,8 +18,13 @@
 #include "library.h"
 #include <SD.h>
 #include <esp_bt.h>
+#include <esp_timer.h>
 #include <BluetoothA2DPSource.h>
 #include <libhelix-mp3/mp3dec.h>     // Helix C API (extern "C")
+
+// ring growth after the Bluetooth link is up (see Player::maybeGrowRing)
+#define RING_GROW_BYTES  (12 * 1024)
+#define RING_KEEP_FREE   (30 * 1024)     // never grow if less than this would stay free
 
 // ---------------------------------------------------------------- ring buffer
 struct Ring {
@@ -66,6 +71,22 @@ struct Ring {
     r = w = n = 0;
     xSemaphoreGive(m);
   }
+  // Swap in a bigger buffer, keeping whatever is queued. The new block is
+  // allocated BEFORE the old one is freed, so a failure changes nothing.
+  bool grow(size_t newSz) {
+    if (newSz <= sz) return true;
+    uint8_t* nb = (uint8_t*)malloc(newSz);
+    if (!nb) return false;
+    xSemaphoreTake(m, portMAX_DELAY);
+    size_t first = min(n, sz - r);
+    memcpy(nb, b + r, first);
+    memcpy(nb + first, b, n - first);
+    uint8_t* old = b;
+    b = nb; r = 0; w = n; sz = newSz;
+    xSemaphoreGive(m);
+    free(old);
+    return true;
+  }
 };
 
 static Ring ring;
@@ -89,6 +110,9 @@ static volatile uint32_t g_frames = 0;     // PCM frames delivered to Bluetooth 
 static volatile uint32_t g_dur = 0;
 static volatile float g_base = 0;          // seconds at open/seek point
 static volatile uint16_t g_gainQ8 = 100;
+static volatile bool g_prebuf = false;     // after open/seek: stay silent until the ring has some audio
+static volatile uint32_t g_underruns = 0;  // BT callback found the ring short while playing
+static volatile uint32_t g_maxDecUs = 0;   // slowest single MP3 frame decode since last report
 static uint32_t decGen = 0;
 static uint32_t g_aStart = 0, g_aEnd = 0;
 static int g_cur = -1;
@@ -118,7 +142,7 @@ static void pushPcm(const uint8_t* d, size_t len) {
     if (g_gen != decGen) return;                // new command pending: drop this data
     size_t k = ring.write(d, len);
     d += k; len -= k;
-    if (len) vTaskDelay(pdMS_TO_TICKS(5));
+    if (len) vTaskDelay(1);                     // 1 tick: refill as soon as BT drains the ring
   }
 }
 
@@ -269,6 +293,7 @@ static void doSeek(float frac) {
   Library::sdExit();
   streamReset();
   ring.flush();
+  g_prebuf = true;
   g_base = g_dur ? frac * g_dur : 0;
   g_frames = 0;
   g_eof = false;
@@ -299,7 +324,10 @@ static void stepDecode() {
 
   unsigned char* rp = inBuf + inPos;
   int bl = avail;
+  uint32_t t0 = (uint32_t)esp_timer_get_time();
   int err = MP3Decode(dec, &rp, &bl, pcmBuf, 0);
+  uint32_t dt = (uint32_t)esp_timer_get_time() - t0;
+  if (dt > g_maxDecUs) g_maxDecUs = dt;
   inPos = (int)(rp - inBuf);
 
   if (err == ERR_MP3_NONE) {
@@ -338,6 +366,7 @@ static void decodeTask(void*) {
       if (c.type == CMD_OPEN) {
         closeFile();
         ring.flush();
+        g_prebuf = true;
         g_frames = 0; g_base = 0; g_dur = 0; g_eof = false; g_fail = false;
         streamReset();
         bool ok = g_decOk;
@@ -386,7 +415,19 @@ static int32_t a2dpData(Frame* out, int32_t frames) {
     memset(out, 0, need);                        // keep the link alive with silence
     return frames;
   }
+  if (g_prebuf) {                                // let the decoder get ahead before the first sample
+    static uint32_t pbStart = 0;
+    if (!pbStart) pbStart = millis();
+    if (ring.count() >= ring.sz * 2 / 3 || g_eof || millis() - pbStart > 500) {
+      g_prebuf = false;
+      pbStart = 0;
+    } else {
+      memset(out, 0, need);
+      return frames;
+    }
+  }
   size_t got = ring.read((uint8_t*)out, need);
+  if (got < need && !g_eof) g_underruns++;
   int16_t* s = (int16_t*)out;
   size_t cnt = got / 2;
   uint32_t g = g_gainQ8;
@@ -457,7 +498,10 @@ void begin() {
   }
   cmdQ = xQueueCreate(1, sizeof(Cmd));
   applyVolume();
-  xTaskCreatePinnedToCore(decodeTask, "mp3dec", DEC_STACK, nullptr, 3, &g_decTask, 0);
+  // Core 1, not 0: the Bluetooth controller, Bluedroid and the SBC encoder all run on
+  // core 0 at high priority and were stealing time from the decoder (audible cuts).
+  // Core 1 only has LVGL, and prio 2 > the Arduino loop task (1) keeps audio first.
+  xTaskCreatePinnedToCore(decodeTask, "mp3dec", DEC_STACK, nullptr, 2, &g_decTask, 1);
 
   // NOTE: no esp_bt_mem_release(ESP_BT_MODE_BLE) here — the anticipation of
   // the ~10 KB BLE pools saving backfired on the Arduino IDF-4.4 controller
@@ -551,9 +595,42 @@ void seek(float frac) {
   post(c);
 }
 
+// The ring starts small (6 KB) because the Bluetooth connect needs the heap. Once the
+// link is up and the heap has recovered, widen it: more cushion against SD / BT hiccups.
+static void maybeGrowRing() {
+  static uint8_t tries = 0;
+  static uint32_t last = 0;
+  if (tries >= 6 || ring.sz >= RING_GROW_BYTES) return;
+  if (millis() - last < 4000 || !a2dp.is_connected()) return;
+  last = millis();
+  tries++;
+  size_t delta = RING_GROW_BYTES - ring.sz;
+  size_t freeNow = ESP.getFreeHeap();
+  size_t block = ESP.getMaxAllocHeap();
+  if (freeNow < delta + RING_KEEP_FREE || block < RING_GROW_BYTES + 2048) {
+    Serial.printf("[audio] ring stays %uB (heap free=%u maxblock=%u)\n",
+                  (unsigned)ring.sz, (unsigned)freeNow, (unsigned)block);
+    return;
+  }
+  bool ok = ring.grow(RING_GROW_BYTES);
+  Serial.printf("[audio] ring %s -> %uB (heap free now=%u)\n", ok ? "grown" : "grow FAILED",
+                (unsigned)ring.sz, (unsigned)ESP.getFreeHeap());
+}
+
 void update() {
   static uint8_t fails = 0;
   static bool probed = false;
+  static uint32_t lastDiag = 0, lastUr = 0;
+  maybeGrowRing();
+  if (g_loaded && !g_paused && !g_switching && millis() - lastDiag > 5000) {   // audio health, serial only
+    lastDiag = millis();
+    uint32_t ur = g_underruns;
+    Serial.printf("[audio] underruns=%u (+%u) ring=%u/%u slowest decode=%lu ms\n",
+                  (unsigned)ur, (unsigned)(ur - lastUr), (unsigned)ring.n, (unsigned)ring.sz,
+                  (unsigned long)(g_maxDecUs / 1000));
+    lastUr = ur;
+    g_maxDecUs = 0;
+  }
   if (!g_loaded || g_switching) return;
   if (g_fail) {                                  // unreadable file: skip, but don't loop forever
     g_fail = false;

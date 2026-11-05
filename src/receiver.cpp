@@ -10,7 +10,8 @@
 //    1. softAP "MyPod-XXXX" (pass 12345678) + web portal at
 //       http://192.168.4.1  ->  home SSID/password + bot token (NVS).
 //    2. A task on core 0 connects to the home network and long-polls
-//       your bot; audio/mp3 documents are saved to /music/telegram.
+//       your bot; audio/mp3 documents are saved to /music/telegram
+//       (only the attachment's own file_id, never its cover thumbnail).
 //    3. Exit: /exit in the browser, or hold BOOT for 3 s. Normal
 //       player resumes (received songs appear after a library scan).
 // ============================================================
@@ -104,7 +105,22 @@ static int jsonStrVal(const String& body, const char* key, char* out, size_t cap
     if (c == '"') break;
     if (c == '\\' && p + 1 < (int)body.length()) {  // tiny unescape
       char n = body[p + 1];
+      if (n == 'u' && p + 5 < (int)body.length()) {   // \uXXXX -> UTF-8
+        char hex[5] = { body[p + 2], body[p + 3], body[p + 4], body[p + 5], 0 };
+        unsigned cp = (unsigned)strtoul(hex, nullptr, 16);
+        p += 6;
+        if (cp >= 0xD800 && cp <= 0xDFFF) cp = '?';    // surrogate half: not drawable anyway
+        if (cp < 0x80) {
+          if (o + 1 < cap) out[o++] = (char)cp;
+        } else if (cp < 0x800) {
+          if (o + 2 < cap) { out[o++] = (char)(0xC0 | (cp >> 6)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
+        } else {
+          if (o + 3 < cap) { out[o++] = (char)(0xE0 | (cp >> 12)); out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[o++] = (char)(0x80 | (cp & 0x3F)); }
+        }
+        continue;
+      }
       if (n == '"' || n == '\\' || n == '/') c = n;
+      else if (n == 'n' || n == 't' || n == 'r') c = ' ';
       p++;
     }
     out[o++] = c;
@@ -130,6 +146,48 @@ static long long jsonNumVal(const String& body, const char* key, int from = 0) {
   return sign * v;
 }
 
+// Copies the JSON object that follows `"key":{` into `out`, with every NESTED
+// {...} object dropped. Telegram's "document" object lists its "thumbnail"
+// (a tiny cover JPEG with its OWN file_id) BEFORE the real file_id, so a plain
+// "first file_id in the message" search downloads the thumbnail instead of the
+// song. Flattening leaves only the object's own top-level fields.
+static bool flatObject(const String& body, const char* key, String& out) {
+  String pat = String("\"") + key + "\":{";
+  int p = body.indexOf(pat);
+  if (p < 0) return false;
+  p += pat.length();
+  int n = body.length();
+  int depth = 1;
+  bool inStr = false;
+  out = "";
+  for (; p < n && depth > 0; p++) {
+    char c = body[p];
+    if (inStr) {
+      if (depth == 1) out += c;
+      if (c == '\\' && p + 1 < n) { p++; if (depth == 1) out += body[p]; }
+      else if (c == '"') inStr = false;
+      continue;
+    }
+    if (c == '"') { inStr = true; if (depth == 1) out += c; }
+    else if (c == '{') depth++;
+    else if (c == '}') depth--;
+    else if (depth == 1) out += c;
+  }
+  return true;
+}
+
+// "<base>.mp3" -> first free "<dir>/<base>.mp3", "<dir>/<base>_2.mp3", ...
+// (the old code appended _2 AFTER .mp3, so duplicates were not seen as songs)
+static void uniquePath(const char* dir, const char* sane, char* out, size_t cap) {
+  char base[96];
+  strlcpy(base, sane, sizeof(base));
+  size_t bl = strnlen(base, sizeof(base));
+  if (bl > 4 && strcasecmp(base + bl - 4, ".mp3") == 0) base[bl - 4] = '\0';
+  snprintf(out, cap, "%s/%s.mp3", dir, base);
+  for (int dup = 2; SD.exists(out) && dup < 99; dup++)
+    snprintf(out, cap, "%s/%s_%d.mp3", dir, base, dup);
+}
+
 static void sanitizeName(const char* in, char* out, size_t cap) {
   size_t o = 0;
   for (const char* s = in; *s && o + 1 < cap - 5; s++) {
@@ -138,6 +196,8 @@ static void sanitizeName(const char* in, char* out, size_t cap) {
         c == ' ' || c == '-' || c == '_' || c == '(' || c == ')' || c == '.') {
       if (c == '/' || c == '\\') c = '_';
       out[o++] = (char)c;
+    } else if (c >= 0x80 && c < 0xC0) {
+      // UTF-8 continuation byte: the lead byte already produced one '_'
     } else {
       out[o++] = '_';
     }
@@ -220,10 +280,34 @@ static int apiGet(const char* url, String& body) {
   return code;
 }
 
-static bool saveMessage(long long chatId, long long updateId, const char* tok,
-                        const char* fileId, const char* fileName);
+// 1 = saved, 0 = transient failure (retry), -1 = permanent failure (skip it)
+static int saveMessage(long long chatId, long long updateId, const char* tok,
+                       const char* fileId, const char* fileName);
 
-static void rxTask(void*) {  if (!SD.begin(SD_CS)) {
+static void sendChat(long long chatId, const char* tok, const char* text) {
+  if (chatId <= 0) return;
+  String enc;
+  pctEncode(text, enc, 140);
+  String aurl = apiBase;
+  aurl += "/bot";
+  aurl += tok;
+  aurl += "/sendMessage?chat_id=";
+  aurl += String((long long)chatId);
+  aurl += "&text=";
+  aurl += enc;
+  String junk;
+  apiGet(aurl.c_str(), junk);
+}
+
+// Same bus/speed as the player (library.cpp). Plain SD.begin(SD_CS) runs the
+// card at 4 MHz, which made a multi-MB song take minutes to write.
+static SPIClass rxSdSpi(VSPI);
+static bool sdBegin() {
+  rxSdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  return SD.begin(SD_CS, rxSdSpi, 20000000);
+}
+
+static void rxTask(void*) {  if (!sdBegin()) {
     sdOk = false;
     snprintf(txtErr, sizeof(txtErr), "SD card: not found");
   } else {
@@ -246,7 +330,7 @@ static void rxTask(void*) {  if (!SD.begin(SD_CS)) {
     memcpy(&c, (const void*)&creds, sizeof(c));
 
     if (!sdOk) {                      // user may have inserted the card meanwhile
-      if (SD.begin(SD_CS)) {
+      if (sdBegin()) {
         sdOk = true;
         SD.mkdir("/music");
         SD.mkdir("/music/telegram");
@@ -294,37 +378,42 @@ static void rxTask(void*) {  if (!SD.begin(SD_CS)) {
     // chat id, so the acknowledgement can be addressed without extra parsing
     long long chatId = jsonNumVal(body, "id");
 
-    // inspect the update for a document/audio attachment
+    // inspect the update for an audio / document attachment. Only the
+    // attachment object's OWN fields are read (see flatObject): its nested
+    // thumbnail has a different file_id that must never be downloaded.
     bool handled = false;
-    bool sawFile = false;
-    int p = 0;
-    while (!handled) {
-      p = jsonStrVal(body, "file_id", fid, sizeof(fid), p);
-      if (p < 0) break;
-      sawFile = true;
-      // Telegram's document/audio objects list file_name and mime_type
-      // BEFORE file_id — searching them from the file_id hit would miss
-      // them entirely and every song would look like "not audio". Parse
-      // each field from the start of the (single-)update body instead.
-      if (jsonStrVal(body, "file_name", fname, sizeof(fname)) < 0) fname[0] = '\0';
-      if (jsonStrVal(body, "mime_type", mime, sizeof(mime)) < 0) mime[0] = '\0';
-      // audio-style sends (Telegram's music player) carry no file_name: fall
-      // back to the track title, then a numbered name so songs never collide
-      if (!fname[0] && jsonStrVal(body, "title", fname, sizeof(fname)) < 0)
-        fname[0] = '\0';
-      if (!fname[0]) snprintf(fname, sizeof(fname), "audio_%lld", (long long)id + 1);
-      if (isAudioDoc(mime, fname)) {
-        handled = saveMessage(chatId, id, c.tok, fid, fname);
-        if (handled) {
-          rxCount++;
-          Cfg::setLibDirty(true);          // the player rebuilds /music.idx on next boot
-        }
-      } else {
-        handled = true;              // not a song: skip it, advance offset
+    String obj;
+    bool isAudioMsg = flatObject(body, "audio", obj);
+    if (!isAudioMsg && !flatObject(body, "document", obj)) {
+      handled = true;                    // text/photo/voice/etc: not a song -> advance
+    } else {
+      char title[64] = "", perf[48] = "";
+      fid[0] = fname[0] = mime[0] = '\0';
+      jsonStrVal(obj, "file_id", fid, sizeof(fid));
+      jsonStrVal(obj, "file_name", fname, sizeof(fname));
+      jsonStrVal(obj, "mime_type", mime, sizeof(mime));
+      jsonStrVal(obj, "title", title, sizeof(title));
+      jsonStrVal(obj, "performer", perf, sizeof(perf));
+      // music-player sends may carry no file_name: build one from the tags
+      // Telegram gives us, so the song is at least named "Artist - Title"
+      if (!fname[0]) {
+        if (perf[0] && title[0]) snprintf(fname, sizeof(fname), "%s - %s", perf, title);
+        else if (title[0])       strlcpy(fname, title, sizeof(fname));
+        else                     snprintf(fname, sizeof(fname), "audio_%lld", (long long)id + 1);
       }
-      p += 1;
+      if (!fid[0] || !(isAudioMsg || isAudioDoc(mime, fname))) {
+        handled = true;                  // not a song: skip it, advance offset
+      } else {
+        int r = saveMessage(chatId, id, c.tok, fid, fname);
+        if (r == 1) {
+          rxCount++;
+          Cfg::setLibDirty(true);        // the player rebuilds /music.idx on next boot
+          handled = true;
+        } else if (r < 0) {
+          handled = true;                // permanent failure, user was told in chat
+        }
+      }
     }
-    if (!sawFile) handled = true;          // text/photo/etc: not a song -> advance
 
     if (handled) {
       rxOffset = id + 1;
@@ -333,7 +422,7 @@ static void rxTask(void*) {  if (!SD.begin(SD_CS)) {
       // one bad file must not wedge the whole queue: retry briefly, then skip
       backoff++;
       vTaskDelay(pdMS_TO_TICKS(backoff > 3 ? 8000 : 3000));
-      if (backoff > 6) {                   // ~40 s of retries, then move on
+      if (backoff > 2) {                   // a retry re-downloads the whole song: try 3x, then move on
         Serial.printf("[RX] save failed for %s - skipping\n", fname);
         rxOffset = id + 1;
         backoff = 0;
@@ -345,8 +434,8 @@ static void rxTask(void*) {  if (!SD.begin(SD_CS)) {
   }
 }
 
-static bool saveMessage(long long chatId, long long updateId, const char* tok,
-                        const char* fileId, const char* fileName) {
+static int saveMessage(long long chatId, long long updateId, const char* tok,
+                       const char* fileId, const char* fileName) {
   (void)updateId;
 
   // 1. resolve file path (Telegram file ids are URL-safe characters)
@@ -354,33 +443,34 @@ static bool saveMessage(long long chatId, long long updateId, const char* tok,
   snprintf(url, sizeof(url), "%s/bot%s/getFile?file_id=%s", apiBase, tok, fileId);
   String body;
   int code = apiGet(url, body);
+  if (code == 400) {
+    // Bot API refuses getFile for files over 20 MB (or an expired id): retrying
+    // can never work, so say so in the chat instead of failing silently.
+    snprintf(txtErr, sizeof(txtErr), "getFile refused (400)");
+    sendChat(chatId, tok, "MyPod: Telegram bots can only download files up to 20 MB. "
+                          "Send a smaller MP3 (or copy it to the SD card).");
+    return -1;
+  }
   if (code != 200) {
     snprintf(txtErr, sizeof(txtErr), "getFile failed (%d)", code);
-    return false;
+    return 0;
   }
   char fpath[200];
   if (jsonStrVal(body, "file_path", fpath, sizeof(fpath)) < 0) {
     snprintf(txtErr, sizeof(txtErr), "file_path missing");
-    return false;
+    return 0;
   }
   long long fsz = jsonNumVal(body, "file_size");
   if (fsz > (long long)100 * 1024 * 1024) {
     snprintf(txtErr, sizeof(txtErr), "file too big to save");
-    return false;
+    return -1;
   }
 
   // 2. build a safe destination name
   char sane[96];
   sanitizeName(fileName, sane, sizeof(sane));
-  char path[PATH_MAX_LEN];
-  snprintf(path, sizeof(path), "/music/telegram/%s", sane);
   char finalPath[PATH_MAX_LEN];
-  strlcpy(finalPath, path, sizeof(finalPath));
-  int dup = 2;
-  while (SD.exists(finalPath) && dup < 99) {
-    snprintf(finalPath, sizeof(finalPath), "%s_%d", path, dup);
-    dup++;
-  }
+  uniquePath("/music/telegram", sane, finalPath, sizeof(finalPath));
 
   // 3. stream the file down (HTTPClient streams, no full-body buffer)
   tgState = 2;
@@ -402,52 +492,96 @@ static bool saveMessage(long long chatId, long long updateId, const char* tok,
   if (!opened) {
     tgState = 1;
     snprintf(txtErr, sizeof(txtErr), "file download open failed");
-    return false;
+    return 0;
   }
   int code2 = http.GET();
   if (code2 != 200) {
     http.end();
     tgState = 1;
     snprintf(txtErr, sizeof(txtErr), "download failed (%d)", code2);
-    return false;
+    return 0;
   }
   File f = SD.open(finalPath, FILE_WRITE);
   if (!f) {
     http.end();
     tgState = 1;
     snprintf(txtErr, sizeof(txtErr), "SD write failed");
-    return false;
+    return 0;
   }
   int total = http.getSize();               // -1 when chunked
-  int wr = http.writeToStream(&f);
+  if (total <= 0 && fsz > 0) total = (int)fsz;
+  WiFi.setSleep(false);                     // modem sleep throttles throughput badly
+
+  // Read from the socket into a large buffer and write the SD in big blocks
+  // (HTTPClient::writeToStream writes ~1.4 KB at a time = slow on SPI SD).
+  const size_t BUFSZ = 8192;
+  uint8_t* buf = (uint8_t*)malloc(BUFSZ);
+  size_t bsz = BUFSZ;
+  if (!buf) { bsz = 1024; buf = (uint8_t*)malloc(bsz); }
+  if (!buf) {
+    f.close(); http.end(); SD.remove(finalPath);
+    tgState = 1;
+    snprintf(txtErr, sizeof(txtErr), "out of memory");
+    return 0;
+  }
+  WiFiClient* stream = http.getStreamPtr();
+  int wr = 0;                               // bytes written to SD
+  bool sdFail = false;
+  uint32_t lastData = millis(), lastShow = 0, t0 = millis();
+  while ((http.connected() || stream->available()) && (total <= 0 || wr < total)) {
+    int avail = stream->available();
+    if (avail > 0) {
+      int n = stream->readBytes(buf, (size_t)avail > bsz ? bsz : (size_t)avail);
+      if (n <= 0) continue;
+      if ((int)f.write(buf, n) != n) { sdFail = true; break; }
+      wr += n;
+      lastData = millis();
+      if (millis() - lastShow > 700) {      // percent first: the TFT shows ~24 chars
+        lastShow = millis();
+        if (total > 0) snprintf(txtErr, sizeof(txtErr), "saving %d%% %s", (int)((long long)wr * 100 / total), sane);
+        else           snprintf(txtErr, sizeof(txtErr), "saving %dKB %s", wr / 1024, sane);
+      }
+    } else {
+      if (millis() - lastData > 15000) break;   // stalled: give up, retry
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
+  }
+  free(buf);
   f.close();
   http.end();
   tgState = 1;
-  if (wr <= 0 || (total > 0 && wr < total)) {
+  Serial.printf("[RX] download %d/%d bytes in %lu ms%s\n", wr, total,
+                (unsigned long)(millis() - t0), sdFail ? " (SD write error)" : "");
+  if (sdFail) wr = -1;
+
+  // 4. verify what actually landed on the card: right size, and really an
+  // MP3 stream (a cover thumbnail / error page must never pass as a song)
+  bool bad = (wr <= 0) || (total > 0 && wr < total) || (fsz > 0 && wr < fsz);
+  uint8_t mg[4] = {0, 0, 0, 0};
+  if (!bad) {
+    File chk = SD.open(finalPath, FILE_READ);
+    size_t sz = chk ? chk.size() : 0;
+    if (chk) { chk.read(mg, 4); chk.close(); }
+    if (sz != (size_t)wr || sz < 4) bad = true;
+    if (mg[0] == 0xFF && mg[1] == 0xD8) bad = true;                  // JPEG
+    if (mg[0] == 0x89 && mg[1] == 'P' && mg[2] == 'N') bad = true;   // PNG
+    if (mg[0] == '<' || mg[0] == '{') bad = true;                    // HTML / JSON error body
+  }
+  if (bad) {
     SD.remove(finalPath);
     snprintf(txtErr, sizeof(txtErr), "download incomplete");
-    return false;
+    Serial.printf("[RX] bad download for %s (wr=%d total=%d expect=%lld)\n",
+                  sane, wr, total, fsz);
+    return 0;
   }
   snprintf(txtErr, sizeof(txtErr), "saved %s", sane);
   Serial.printf("[RX] saved %s (%d bytes)\n", finalPath, wr);
 
-  // 4. acknowledge in the chat so the user sees it landed (needs chat_id!)
-  if (chatId > 0) {
-    String text = "Saved to MyPod: ";
-    text += sane;
-    String enc;
-    pctEncode(text.c_str(), enc, 140);
-    String aurl = apiBase;
-    aurl += "/bot";
-    aurl += tok;
-    aurl += "/sendMessage?chat_id=";
-    aurl += String((long long)chatId);
-    aurl += "&text=";
-    aurl += enc;
-    String junk;
-    apiGet(aurl.c_str(), junk);
-  }
-  return true;
+  // 5. acknowledge in the chat so the user sees it landed (needs chat_id!)
+  String text = "Saved to MyPod: ";
+  text += sane;
+  sendChat(chatId, tok, text.c_str());
+  return 1;
 }
 
 // ============================ web portal ============================
@@ -625,15 +759,8 @@ static void pullUrl(const char* args) {
 
   char sane[96];
   sanitizeName(fname, sane, sizeof(sane));
-  char path[PATH_MAX_LEN];
-  snprintf(path, sizeof(path), "/music/%s", sane);
   char finalPath[PATH_MAX_LEN];
-  strlcpy(finalPath, path, sizeof(finalPath));
-  int dup = 2;
-  while (SD.exists(finalPath) && dup < 99) {
-    snprintf(finalPath, sizeof(finalPath), "%s_%d", path, dup);
-    dup++;
-  }
+  uniquePath("/music", sane, finalPath, sizeof(finalPath));
 
   WiFiClient wc;                             // plain HTTP, no TLS buffers
   HTTPClient http;
