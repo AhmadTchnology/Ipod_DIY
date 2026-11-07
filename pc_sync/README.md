@@ -2,6 +2,18 @@
 
 Copies MP3 files, their tags and their **album covers** to the DIY iPod over the USB cable.
 
+## Run without installing anything (single .exe)
+
+`MyPodSync.exe` — a single file, ~80 MB, nothing to install. Copy it anywhere
+(Desktop, USB stick, another PC) and double-click. It needs no Python and no
+admin rights; it saves `mypod_cfg.json`, `downloads/` and `selftest.log` next
+to itself, so put it in its own folder.
+
+It can also be built from this folder with:
+`pip install pyinstaller` then `py -m PyInstaller --clean --noconfirm MyPodSync.spec`
+(the exe appears in `dist/`). Add `--selftest` on the command line to check a
+build (ffmpeg + YouTube search) without opening the window.
+
 ## Install (once)
 
 1. Install Python 3.9 or newer (on Windows tick "Add Python to PATH"; on Linux also `sudo apt install python3-tk`).

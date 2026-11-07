@@ -6,6 +6,7 @@ pick the COM port, press Connect, add songs, press Send.
 """
 import os
 import queue
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -749,5 +750,33 @@ class App(tk.Tk):
         self.destroy()
 
 
+def _selftest():
+    """--selftest: verify a frozen (PyInstaller) build without opening the GUI.
+    Checks the bundled ffmpeg and a live yt-dlp search, writes selftest.log
+    next to the exe."""
+    import traceback
+    lines = [f"MyPod Sync self-test  |  exe: {sys.executable}"]
+    try:
+        ff = YT.resolve_ffmpeg()
+        lines.append(f"ffmpeg: {ff or 'NOT FOUND'}")
+        res = YT.search("ed sheeran shape of you", limit=3)
+        lines.append(f"yt-dlp search: {len(res)} result(s)")
+        for r in res:
+            lines.append(f"  - {r['title'][:60]}")
+        lines.append("SELFTEST OK" if (ff and res) else "SELFTEST FAILED")
+    except Exception:
+        lines.append("SELFTEST FAILED:\n" + traceback.format_exc())
+    text = "\n".join(lines) + "\n"
+    try:
+        with open(os.path.join(YT.APP_DIR, "selftest.log"), "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+    print(text)
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    if "--selftest" in sys.argv[1:]:
+        _selftest()
+    else:
+        App().mainloop()

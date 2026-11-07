@@ -8,13 +8,22 @@ import json
 import os
 import re
 import shutil
+import sys
 import urllib.request
 
 import mypod_media as M
 import mypod_proto as P
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mypod_cfg.json")
+
+# Folder for the user's files: next to the script, or next to the exe when
+# frozen with PyInstaller (a one-file exe extracts to a temp dir that is
+# deleted on exit, so __file__ must never be used for saving anything there).
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(APP_DIR, "mypod_cfg.json")
 
 # bracket suffixes YouTube adds: "(Official Music Video)", "[Lyric Audio HD]", ...
 _JUNK_BRACKET = re.compile(
@@ -71,12 +80,20 @@ def save_cfg(cfg):
 
 def resolve_ffmpeg(saved=None):
     """-> path to a usable ffmpeg binary, or None. Order: saved setting, PATH,
-    then the binary that the ``imageio-ffmpeg`` pip package bundles."""
+    the binary bundled in a frozen (PyInstaller) build, then the binary that
+    the ``imageio-ffmpeg`` pip package bundles."""
     if saved and os.path.isfile(saved):
         return saved
     found = shutil.which("ffmpeg")
     if found:
         return found
+    if getattr(sys, "frozen", False):
+        bdir = os.path.join(getattr(sys, "_MEIPASS", ""), "imageio_ffmpeg", "binaries")
+        if os.path.isdir(bdir):
+            for fn in sorted(os.listdir(bdir)):
+                p = os.path.join(bdir, fn)
+                if fn.lower().startswith("ffmpeg") and os.path.isfile(p):
+                    return p
     try:
         import imageio_ffmpeg
         return imageio_ffmpeg.get_ffmpeg_exe()
@@ -85,7 +102,7 @@ def resolve_ffmpeg(saved=None):
 
 
 def cache_dir(base=None):
-    d = base or os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
+    d = base or os.path.join(APP_DIR, "downloads")
     os.makedirs(d, exist_ok=True)
     return d
 
