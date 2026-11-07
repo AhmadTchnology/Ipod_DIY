@@ -14,8 +14,51 @@ Copies MP3 files, their tags and their **album covers** to the DIY iPod over the
 1. On the iPod: **Settings -> USB SYNC -> Copy songs from PC (USB)... -> Restart**. The screen shows "USB SYNC".
 2. Run `python mypod_sync.py` (Windows: double-click `run_windows.bat`).
 3. Pick the pod's port, press **Connect**. The window shows the card size and the songs already on it.
-4. **Add files...** / **Add folder...**, check the list (select a row to preview its cover), press **Send to iPod**.
+4. Add songs from your files (**Add files...** / **Add folder...**), import an
+   **.m3u playlist** (see below), or from YouTube (next section),
+   check the list (select a row to preview its cover), press **Send to iPod**.
 5. When finished press **Finish & start the player**. The pod restarts and scans the card by itself.
+
+## Playlists (.m3u)
+
+**Import .m3u playlist...** on the *Songs to send* tab loads a playlist file
+and queues every entry of it:
+
+* **YouTube links** (a playlist exported from YouTube, a browser or a media player)
+  are handled like anything from the YouTube tab: downloaded, converted, tagged with
+  the cover art. Songs that are already in the local cache are reused as-is.
+* **Local MP3 paths** (absolute or relative to the playlist file) are added directly.
+* Entries that are neither (dead link, missing file) are skipped and listed in the log.
+* The same song listed twice is queued only once.
+* UTF-8 (Arabic, Russian, CJK...) and Windows-1252 playlists are both decoded correctly.
+* A 121-entry playlist imports in about a second; nothing is downloaded until you
+  press **Download now** or **Send to iPod**.
+
+## From YouTube
+
+The **YouTube** tab searches YouTube itself:
+
+1. Type what you are looking for, press **Search** (or Enter). Results appear with
+   thumbnails, the channel name and the duration; the "(Official Music Video)" and similar
+   junk is cleaned from the song name automatically.
+2. **Double-click a result** (or select several and press **Add selected to send list**,
+   or use **Add all shown**) — they are queued in the *Songs to send* tab with a fresh name guess.
+3. Press **Download now** (bottom bar) to fetch + convert them right away **without**
+   needing the pod, or go straight to **Send to iPod**, which downloads first and then
+   transfers (only the connected pod is needed for the send itself).
+
+Details worth knowing:
+
+* **Audio quality**: 192 kbps by default, 128-320 selectable - lower saves card space.
+* **MP3 conversion needs ffmpeg.** The app looks for it in this order: your PATH, the
+  `imageio-ffmpeg` pip package (installed as part of `requirements.txt`), or a specific
+  location chosen with **Pick ffmpeg.exe...** (saved in `mypod_cfg.json`).
+* Downloads land in `pc_sync/downloads/` - when you send the same song again it is reused
+  and not downloaded twice. Deleting the folder is always safe.
+* YouTube changes its site often: if downloads suddenly fail with errors like *403*,
+  update the downloader:  `pip install -U yt-dlp`  (that already fixed it once during
+  this program's development).
+* Only the *audio* is used, the YouTube cover/thumbnail becomes the pod's 200x200 album art.
 
 The *On the iPod* tab lists what is on the card and lets you delete songs (their covers are deleted too).
 

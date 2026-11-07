@@ -9,7 +9,8 @@ standalone, pocket-sized MP3 player:
   (no widget toolkit, ~0 KB RAM for the UI itself) — the Now Playing screen
   follows the *KLIK MP3 Player* design from Lopaka.
 - A **USB sync mode** and a PC program (`pc_sync/`, "MyPod Sync") that copies
-  MP3s with their tags and **album covers** to the SD card over the USB cable.
+  MP3s with their tags and **album covers** to the SD card over the USB cable —
+  with built-in **YouTube downloading** and `.m3u` playlist import.
 
 No phone app, no cloud, no WiFi — just the pod, an SD card and
 Bluetooth earphones.
@@ -275,8 +276,9 @@ connected, 2 tracks on the SD card, read-ahead enabled):
 ## Repository notes
 
 - `pc_sync/` — the PC-side **MyPod Sync** program that sends MP3 files (with
-  tags and album covers) to the iPod over USB; the firmware side is
-  `src/usbsync.*` + `src/usbsync_engine.h`.
+  tags and album covers) to the iPod over USB; it can also download songs
+  straight from YouTube (converted, tagged, with cover art) and import `.m3u`
+  playlists. The firmware side is `src/usbsync.*` + `src/usbsync_engine.h`.
 - `library.patch` — the exact diff applied to the vendored ESP32-A2DP library
   for the Bluetooth audio-cut fix.
 - `.pio/` (build output, ~240 MB) and local logs are git-ignored.

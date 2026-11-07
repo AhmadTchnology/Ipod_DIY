@@ -1,5 +1,7 @@
 pyserial>=3.5
 mutagen>=1.47
 Pillow>=10.0
+yt-dlp>=2026.10.26        # YouTube search + download (update it when YouTube changes)
+imageio-ffmpeg>=0.5       # bundles a ready-made ffmpeg binary if none is on the PATH
 # optional, makes Arabic / Cyrillic / CJK titles readable on the iPod's ASCII-only font:
 unidecode>=1.3

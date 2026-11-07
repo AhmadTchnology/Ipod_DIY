@@ -1,0 +1,5 @@
+# local YouTube cache and settings (can be big)
+downloads/
+mypod_cfg.json
+__pycache__/
+*.pyc
