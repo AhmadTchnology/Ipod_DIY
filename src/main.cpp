@@ -7,7 +7,8 @@
 #include "library.h"
 #include "player.h"
 #include "ui.h"
-#include "receiver.h"
+#include "usbsync.h"
+#include <esp_timer.h>
 
 void setup() {
   Serial.begin(115200);
@@ -15,7 +16,7 @@ void setup() {
   Cfg::load();
   Th::load();
   Hal::earlyInit();                         // backlight, TFT, splash
-  if (Receiver::enabled()) Receiver::run(); // WiFi receiver mode, never returns
+  if (UsbSync::enabled()) UsbSync::run();   // USB sync mode (PC tool), never returns
   Serial.printf("[heap] after early: %u\n", (unsigned)ESP.getFreeHeap());
   Touch::begin();
   pinMode(PIN_BOOT, INPUT_PULLUP);
@@ -45,10 +46,24 @@ void setup() {
 }
 
 void loop() {
+  uint32_t lw0 = (uint32_t)esp_timer_get_time();
   UI::update();
   Player::update();
   Hal::tick();
   Cfg::tick();
+  uint32_t lw1 = (uint32_t)esp_timer_get_time();
+  {                       // loop-task diagnostics on the audio-cut investigation
+    static uint32_t maxUs = 0, over = 0, last = 0;
+    uint32_t dt = lw1 - lw0;
+    if (dt > maxUs) maxUs = dt;
+    if (dt > 10000) over++;
+    if (millis() - last > 5000 && millis() > 15000) {
+      last = millis();
+      Serial.printf("[loop] work=%luus max=%luus over10ms=%u\n",
+                    (unsigned long)dt, (unsigned long)maxUs, (unsigned)over);
+      maxUs = 0; over = 0;
+    }
+  }
 
   // heap probe for the first 90 s; self-terminates to keep the console quiet
   static uint32_t lastHp = 0;

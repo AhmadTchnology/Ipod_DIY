@@ -1,0 +1,41 @@
+--- /dev/fd/63	2026-11-07 08:40:40.215801819 +0000
++++ /dev/fd/62	2026-11-07 08:40:40.215801819 +0000
+@@ -686,10 +686,10 @@
+       ESP_LOGD(BT_AV_TAG, "%s ESP_A2D_AUDIO_STATE_EVT: %s", __func__,
+                to_str(a2d->audio_stat.state));
+ 
+-      // callback on state change
++      // callback on state change (MyPod patch: track the state even without a callback)
++      audio_state = a2d->audio_stat.state;
+       if (audio_state_callback != nullptr) {
+         audio_state_callback(a2d->audio_stat.state, audio_state_obj);
+-        audio_state = a2d->audio_stat.state;
+       }
+       break;
+   }
+@@ -811,6 +811,8 @@
+         ESP_LOGI(BT_AV_TAG, "a2dp connected");
+         s_a2d_state = APP_AV_STATE_CONNECTED;
+         s_media_state = APP_AV_MEDIA_STATE_IDLE;
++        // MyPod patch: do not wait for the 10 s heartbeat to start streaming
++        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+ 
+       } else if (a2d->conn_stat.state ==
+                  ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+@@ -872,6 +874,16 @@
+       a2d = (esp_a2d_cb_param_t *)(param);
+       if (ESP_A2D_AUDIO_STATE_STARTED == a2d->audio_stat.state) {
+         s_pkt_cnt = 0;
++      } else if (s_media_state == APP_AV_MEDIA_STATE_STARTED) {
++        // MyPod patch: the sink suspended / stopped the stream while we still think it runs.
++        // Ask for a restart (at most once a second) instead of staying silent until reconnect.
++        static uint32_t last_restart = 0;
++        s_media_state = APP_AV_MEDIA_STATE_IDLE;
++        if (get_millis() - last_restart > 1000) {
++          last_restart = get_millis();
++          ESP_LOGW(BT_AV_TAG, "sink stopped the stream (state %d), restarting", (int)a2d->audio_stat.state);
++          esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
++        }
+       }
+       break;
+     }

@@ -20,11 +20,21 @@
 #include <esp_bt.h>
 #include <esp_timer.h>
 #include <BluetoothA2DPSource.h>
+#include "btfix.h"
 #include <libhelix-mp3/mp3dec.h>     // Helix C API (extern "C")
 
 // ring growth after the Bluetooth link is up (see Player::maybeGrowRing)
-#define RING_GROW_BYTES  (12 * 1024)
-#define RING_KEEP_FREE   (30 * 1024)     // never grow if less than this would stay free
+#define RING_GROW_BYTES  (16 * 1024)     // biggest ring we ever try (~90 ms of audio)
+#define RING_GROW_MIN    (10 * 1024)     // smallest worthwhile growth
+#define RING_KEEP_FREE   (44 * 1024)     // PCM ring growth only on a roomy heap (normally it stays 6 KB)
+
+// compressed read-ahead: a task keeps this many bytes of the MP3 file buffered, so an SD-card
+// stall (50-300 ms is normal for SPI cards) no longer starves the decoder. 16 KB of MP3 is about
+// a second of music at 128 kbps, the same RAM as PCM would hold only ~90 ms.
+#define RD_MAX_BYTES     (16 * 1024)
+#define RD_MIN_BYTES     (8 * 1024)
+#define RD_KEEP_FREE     (24 * 1024)     // heap that must stay free after the buffer + task stack
+#define RD_STACK         4608
 
 // ---------------------------------------------------------------- ring buffer
 struct Ring {
@@ -113,6 +123,17 @@ static volatile uint16_t g_gainQ8 = 100;
 static volatile bool g_prebuf = false;     // after open/seek: stay silent until the ring has some audio
 static volatile uint32_t g_underruns = 0;  // BT callback found the ring short while playing
 static volatile uint32_t g_maxDecUs = 0;   // slowest single MP3 frame decode since last report
+static volatile uint32_t g_maxSdUs = 0;    // slowest SD read since last report
+static volatile uint32_t g_starves = 0;    // decoder had to wait for file data
+// BT callback pacing diagnostics (odd audio "cuts" investigation)
+static volatile uint32_t g_btCalls = 0;    // callbacks since last report
+static volatile uint32_t g_btBytes = 0;    // PCM bytes consumed from the ring since last report
+static volatile uint32_t g_maxBtGapUs = 0; // biggest gap between two callbacks
+static volatile uint32_t g_btcOver = 0;    // callbacks more than 20 ms after the previous one
+static volatile uint32_t g_lastBtUs = 0;   // timestamp of the previous callback
+static volatile bool g_rdBroken = false;   // read-ahead stopped delivering: went back to direct reads
+static volatile bool g_openFailed = false; // decoder could not open the file (reported from update())
+static uint32_t g_openAt = 0;              // millis() when the current track was requested
 static uint32_t decGen = 0;
 static uint32_t g_aStart = 0, g_aEnd = 0;
 static int g_cur = -1;
@@ -274,23 +295,96 @@ static void streamReset() {                     // after open / seek
   resetResampler();
 }
 
+// ---- compressed read-ahead (see RD_* above) ---------------------------------------------
+static Ring cring;                               // MP3 bytes read ahead from the card
+static SemaphoreHandle_t rdMx = nullptr;         // guards the file handle + reader state
+static TaskHandle_t g_rdTask = nullptr;
+static volatile bool useCring = false;           // read-ahead ring + task exist and are in use
+static volatile bool rdRun = false;              // reader may read (a file is open)
+static volatile bool rdEof = false;              // reader reached the end of the file
+static bool g_starved = false;
+
+// Take exclusive control of the file (open/seek/close): stops the reader, waits for a read in flight.
+static void rdPause() { rdRun = false; xSemaphoreTake(rdMx, portMAX_DELAY); }
+// Done with the file: drop stale read-ahead and let the reader continue from the file position.
+static void rdResume(bool run) {
+  if (useCring) cring.flush();
+  rdEof = false;
+  rdRun = run && useCring;
+  xSemaphoreGive(rdMx);
+}
+
+static void readerTask(void*) {
+  uint8_t tmp[512];
+  for (;;) {
+    bool did = false;
+    if (rdRun && useCring && (cring.sz - cring.n) >= sizeof(tmp)) {
+      xSemaphoreTake(rdMx, portMAX_DELAY);
+      if (rdRun && fOpen && !rdEof) {
+        uint32_t t0 = (uint32_t)esp_timer_get_time();
+        Library::sdEnter();
+        int n = f.read(tmp, sizeof(tmp));
+        Library::sdExit();
+        uint32_t dt = (uint32_t)esp_timer_get_time() - t0;
+        if (dt > g_maxSdUs) g_maxSdUs = dt;
+        if (n <= 0) rdEof = true;
+        else { cring.write(tmp, n); did = true; }
+      }
+      xSemaphoreGive(rdMx);
+    }
+    if (!did) vTaskDelay(2);
+  }
+}
+
+// Decoder thread: the read-ahead stopped delivering data (should never happen). Give its unread
+// bytes back to the file and go on reading the card directly, so the song plays regardless.
+static void rdDisable() {
+  rdRun = false;
+  xSemaphoreTake(rdMx, portMAX_DELAY);
+  if (fOpen) {
+    size_t unread = cring.count();
+    uint32_t pos = (uint32_t)f.position();
+    Library::sdEnter();
+    f.seek(pos > unread ? pos - unread : 0);
+    Library::sdExit();
+  }
+  cring.flush();
+  rdEof = false;
+  useCring = false;
+  g_rdBroken = true;
+  xSemaphoreGive(rdMx);
+}
+
 static void refill() {
   int left = inLen - inPos;
   if (left > 0 && inPos > 0) memmove(inBuf, inBuf + inPos, left);
   inPos = 0;
   inLen = left > 0 ? left : 0;
   if (fileEof) return;
+  if (useCring) {                                // fed by the reader task: never touches the SD card
+    size_t n = cring.read(inBuf + inLen, IN_SZ - inLen);
+    inLen += (int)n;
+    if (n == 0 && rdEof && cring.count() == 0) fileEof = true;
+    return;
+  }
+  xSemaphoreTake(rdMx, portMAX_DELAY);           // direct read (read-ahead not enabled yet)
+  uint32_t t0 = (uint32_t)esp_timer_get_time();
   Library::sdEnter();
   int n = f.read(inBuf + inLen, IN_SZ - inLen);
   Library::sdExit();
+  uint32_t dt = (uint32_t)esp_timer_get_time() - t0;
+  if (dt > g_maxSdUs) g_maxSdUs = dt;
+  xSemaphoreGive(rdMx);
   if (n <= 0) fileEof = true; else inLen += n;
 }
 
 static void doSeek(float frac) {
   uint32_t pos = g_aStart + (uint32_t)(frac * (float)(g_aEnd - g_aStart));
+  rdPause();
   Library::sdEnter();
   f.seek(pos);
   Library::sdExit();
+  rdResume(true);
   streamReset();
   ring.flush();
   g_prebuf = true;
@@ -304,7 +398,12 @@ static void stepDecode() {
   if (inLen - inPos < MAINBUF_SIZE && !fileEof) refill();
   int avail = inLen - inPos;
   if (avail < 4) {                              // nothing usable left
-    if (fileEof) g_eof = true;
+    if (fileEof) g_eof = true; else { g_starves++; g_starved = true; }
+    return;
+  }
+  if (useCring && avail < MAINBUF_SIZE && !fileEof) {   // read-ahead is behind: wait, don't decode half a frame
+    g_starves++;
+    g_starved = true;
     return;
   }
   int off = MP3FindSyncWord(inBuf + inPos, avail);
@@ -346,11 +445,14 @@ static void stepDecode() {
 }
 
 static void closeFile() {
+  rdPause();
   if (fOpen) { Library::sdEnter(); f.close(); Library::sdExit(); }
   fOpen = false;
+  rdResume(false);
 }
 
 static void decodeTask(void*) {
+  uint32_t starveRun = 0;
   bool decoding = false;
   for (;;) {
     Cmd c;
@@ -371,6 +473,7 @@ static void decodeTask(void*) {
         streamReset();
         bool ok = g_decOk;
         if (ok) {
+          rdPause();
           Library::sdEnter();
           f = SD.open(c.path, FILE_READ);
           ok = (bool)f;
@@ -382,9 +485,10 @@ static void decodeTask(void*) {
             f.seek(g_aStart);
           }
           Library::sdExit();
+          rdResume(ok);
         }
         if (!ok) {
-          g_fail = true; g_eof = true; decoding = false; g_loaded = true; g_switching = false;
+          g_fail = true; g_eof = true; decoding = false; g_loaded = true; g_switching = false; g_openFailed = true;
           g_serial++;
           continue;
         }
@@ -404,12 +508,25 @@ static void decodeTask(void*) {
     if (!decoding) continue;
     if (g_eof) { decoding = false; continue; }  // wait for the next command
     stepDecode();
+    if (g_starved) {                                        // waiting for the reader: don't spin
+      g_starved = false;
+      vTaskDelay(1);
+      if (useCring && ++starveRun > 1500) { starveRun = 0; rdDisable(); }   // ~1.5 s with no data at all
+    } else {
+      starveRun = 0;
+    }
     if (g_eof) decoding = false;
   }
 }
 
 // ---------------------------------------------------------------- Bluetooth side
 static int32_t a2dpData(Frame* out, int32_t frames) {
+  uint32_t tUs = (uint32_t)esp_timer_get_time();
+  uint32_t gap = g_lastBtUs ? tUs - g_lastBtUs : 0;
+  g_lastBtUs = tUs;
+  if (gap > g_maxBtGapUs) g_maxBtGapUs = gap;
+  if (gap > 20000) g_btcOver++;
+  g_btCalls++;
   size_t need = (size_t)frames * 4;
   if (g_paused || !g_loaded || g_switching) {
     memset(out, 0, need);                        // keep the link alive with silence
@@ -427,7 +544,8 @@ static int32_t a2dpData(Frame* out, int32_t frames) {
     }
   }
   size_t got = ring.read((uint8_t*)out, need);
-  if (got < need && !g_eof) g_underruns++;
+  if (got < need) g_underruns++;
+  g_btBytes += got;
   int16_t* s = (int16_t*)out;
   size_t cnt = got / 2;
   uint32_t g = g_gainQ8;
@@ -479,6 +597,9 @@ static void startTrack(int idx, bool pushHist) {
   strlcpy(c.path, p, sizeof(c.path));
   g_switching = true;
   g_paused = false;
+  g_openAt = millis();
+  Serial.printf("[player] open #%d heap free=%u maxblock=%u readahead=%d\n", idx,
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(), (int)useCring);
   post(c);
 }
 
@@ -497,6 +618,7 @@ void begin() {
     ring.init(ringBytes);
   }
   cmdQ = xQueueCreate(1, sizeof(Cmd));
+  rdMx = xSemaphoreCreateMutex();
   applyVolume();
   // Core 1, not 0: the Bluetooth controller, Bluedroid and the SBC encoder all run on
   // core 0 at high priority and were stealing time from the decoder (audible cuts).
@@ -600,36 +722,118 @@ void seek(float frac) {
 static void maybeGrowRing() {
   static uint8_t tries = 0;
   static uint32_t last = 0;
-  if (tries >= 6 || ring.sz >= RING_GROW_BYTES) return;
-  if (millis() - last < 4000 || !a2dp.is_connected()) return;
+  if (tries >= 8 || ring.sz >= RING_GROW_BYTES) return;
+  if (millis() - last < 3000 || !a2dp.is_connected()) return;
   last = millis();
   tries++;
-  size_t delta = RING_GROW_BYTES - ring.sz;
   size_t freeNow = ESP.getFreeHeap();
   size_t block = ESP.getMaxAllocHeap();
-  if (freeNow < delta + RING_KEEP_FREE || block < RING_GROW_BYTES + 2048) {
-    Serial.printf("[audio] ring stays %uB (heap free=%u maxblock=%u)\n",
+  // pick the biggest ring that leaves RING_KEEP_FREE heap and fits in one free block
+  size_t target = 0;
+  for (size_t t = RING_GROW_BYTES; t >= RING_GROW_MIN; t -= 2048) {
+    if (t > ring.sz && freeNow >= (t - ring.sz) + RING_KEEP_FREE && block >= t + 1024) { target = t; break; }
+  }
+  if (!target) {
+    Serial.printf("[audio] ring stays %uB (heap free=%u maxblock=%u) - audio may cut under radio noise\n",
                   (unsigned)ring.sz, (unsigned)freeNow, (unsigned)block);
     return;
   }
-  bool ok = ring.grow(RING_GROW_BYTES);
+  bool ok = ring.grow(target);
   Serial.printf("[audio] ring %s -> %uB (heap free now=%u)\n", ok ? "grown" : "grow FAILED",
                 (unsigned)ring.sz, (unsigned)ESP.getFreeHeap());
+}
+
+// Allocate the compressed read-ahead once the Bluetooth link is up and the heap has recovered.
+static void maybeEnableReadAhead() {
+  static uint8_t tries = 0;
+  static uint32_t last = 0;
+  if (useCring || g_rdBroken || tries >= 8 || !g_decOk) return;
+  if (millis() - last < 3000 || !a2dp.is_connected()) return;
+  last = millis();
+  tries++;
+  size_t freeNow = ESP.getFreeHeap(), block = ESP.getMaxAllocHeap();
+  size_t target = 0;
+  for (size_t t = RD_MAX_BYTES; t >= RD_MIN_BYTES; t -= 4096) {
+    if (freeNow >= t + RD_STACK + 512 + RD_KEEP_FREE && block >= t + 1024) { target = t; break; }
+  }
+  if (!target) {
+    Serial.printf("[audio] read-ahead NOT enabled (heap free=%u maxblock=%u) - SD hiccups can cut the music\n",
+                  (unsigned)freeNow, (unsigned)block);
+    return;
+  }
+  if (!cring.b && !cring.init(target)) { Serial.println("[audio] read-ahead alloc failed"); return; }
+  if (!g_rdTask &&
+      xTaskCreatePinnedToCore(readerTask, "mp3rd", RD_STACK, nullptr, 2, &g_rdTask, 1) != pdPASS) {
+    Serial.println("[audio] read-ahead task failed");
+    return;
+  }
+  xSemaphoreTake(rdMx, portMAX_DELAY);           // switch over: continue from the current file position
+  cring.flush();
+  rdEof = false;
+  useCring = true;
+  rdRun = fOpen;
+  xSemaphoreGive(rdMx);
+  Serial.printf("[audio] read-ahead ON: %uB of MP3 buffered (heap free now=%u)\n",
+                (unsigned)cring.sz, (unsigned)ESP.getFreeHeap());
 }
 
 void update() {
   static uint8_t fails = 0;
   static bool probed = false;
-  static uint32_t lastDiag = 0, lastUr = 0;
+  static uint32_t lastDiag = 0, lastUr = 0, lastSt = 0;
+  BtFix::tick(a2dp, g_loaded && !g_paused);
+  {                         // BT link flap logger: the "plays a second, then buffers" signature
+    static bool wasConn = false, first = true;
+    static uint32_t lastPoll = 0;
+    uint32_t now2 = millis();
+    if (now2 - lastPoll > 200) {
+      lastPoll = now2;
+      bool conn = a2dp.is_connected();
+      if (first || conn != wasConn) {
+        first = false;
+        Serial.printf("[bts] %lu ms: bt %s\n", (unsigned long)now2,
+                      conn ? "CONNECTED" : "DISCONNECTED");
+        wasConn = conn;
+      }
+    }
+  }
+  maybeEnableReadAhead();
   maybeGrowRing();
+  if (g_openFailed) {
+    g_openFailed = false;
+    Serial.printf("[player] could not open/decode the file (heap free=%u)\n", (unsigned)ESP.getFreeHeap());
+  }
+  if (g_rdBroken) {
+    static bool said = false;
+    if (!said) { said = true; Serial.println("[audio] read-ahead stalled -> back to direct SD reads (please report this)"); }
+  }
+  {                                             // a track that was requested but is still silent
+    static uint32_t reportedAt = 0;
+    if (g_loaded && !g_paused && !g_switching && !g_fail && g_frames == 0 && g_openAt &&
+        millis() - g_openAt > 3000 && reportedAt != g_openAt) {
+      reportedAt = g_openAt;
+      Serial.printf("[player] NO AUDIO %lus after open: bt=%d eof=%d prebuf=%d pcm=%u/%u readahead=%d rdRun=%d rdEof=%d mp3buf=%u starves=%u heap=%u\n",
+                    (unsigned long)((millis() - g_openAt) / 1000), (int)a2dp.is_connected(), (int)g_eof, (int)g_prebuf,
+                    (unsigned)ring.n, (unsigned)ring.sz, (int)useCring, (int)rdRun, (int)rdEof,
+                    (unsigned)(useCring ? cring.n : 0), (unsigned)g_starves, (unsigned)ESP.getFreeHeap());
+    }
+  }
   if (g_loaded && !g_paused && !g_switching && millis() - lastDiag > 5000) {   // audio health, serial only
     lastDiag = millis();
     uint32_t ur = g_underruns;
-    Serial.printf("[audio] underruns=%u (+%u) ring=%u/%u slowest decode=%lu ms\n",
+    uint32_t st = g_starves;
+    uint32_t calls = g_btCalls, bytes = g_btBytes;
+    uint32_t maxGap = g_maxBtGapUs, over = g_btcOver;
+    Serial.printf("[audio] underruns=%u (+%u) pcm=%u/%u mp3buf=%u/%u | slowest decode=%lu ms, slowest SD read=%lu ms, decoder waited for data +%u | heap free=%u\n",
                   (unsigned)ur, (unsigned)(ur - lastUr), (unsigned)ring.n, (unsigned)ring.sz,
-                  (unsigned long)(g_maxDecUs / 1000));
-    lastUr = ur;
-    g_maxDecUs = 0;
+                  (unsigned)(useCring ? cring.n : 0), (unsigned)(useCring ? cring.sz : 0),
+                  (unsigned long)(g_maxDecUs / 1000), (unsigned long)(g_maxSdUs / 1000),
+                  (unsigned)(st - lastSt), (unsigned)ESP.getFreeHeap());
+    Serial.printf("[bt] calls=%u bytes=%u maxGap=%luus over20ms=%u\n",
+                  (unsigned)calls, (unsigned)bytes, (unsigned long)maxGap, (unsigned)over);
+    lastUr = ur; lastSt = st;
+    g_maxDecUs = 0; g_maxSdUs = 0;
+    g_btCalls = 0; g_btBytes = 0; g_maxBtGapUs = 0; g_btcOver = 0;
   }
   if (!g_loaded || g_switching) return;
   if (g_fail) {                                  // unreadable file: skip, but don't loop forever

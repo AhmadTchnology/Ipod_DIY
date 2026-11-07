@@ -87,7 +87,9 @@ void earlyInit() {
 
 // ---------- power ----------
 void applyPower() {
-  setCpuFrequencyMhz(CPU_MHZ[S.cpuIdx]);
+  // MP3 decode + Bluetooth SBC encode need headroom: below 240 MHz the decoder
+  // can fall behind for a moment and the music cuts out. Floor the clock at 240.
+  setCpuFrequencyMhz(CPU_MHZ[S.cpuIdx < 2 ? 2 : S.cpuIdx]);
   if (!S.statusLed) {                      // setting off: all channels dark
     digitalWrite(LED_R, HIGH);
     digitalWrite(LED_G, HIGH);

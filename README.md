@@ -8,11 +8,10 @@ standalone, pocket-sized MP3 player:
 - A smooth **240x320 touch UI** drawn straight to the display with TFT_eSPI
   (no widget toolkit, ~0 KB RAM for the UI itself) — the Now Playing screen
   follows the *KLIK MP3 Player* design from Lopaka.
-- A **WiFi receiver mode** that opens its own hotspot + web portal, so a phone
-  can hand it your home WiFi and a **Telegram bot token** — then any MP3 sent
-  to that bot lands on the SD card and shows up in the library.
+- A **USB sync mode** and a PC program (`pc_sync/`, "MyPod Sync") that copies
+  MP3s with their tags and **album covers** to the SD card over the USB cable.
 
-No phone app, no cloud dependency for playback — just the pod, an SD card and
+No phone app, no cloud, no WiFi — just the pod, an SD card and
 Bluetooth earphones.
 
 ![UI preview (rendered by a desktop simulator of the real ui.cpp)](docs/ui-preview.png)
@@ -24,13 +23,13 @@ Bluetooth earphones.
 | Area | What you get |
 |---|---|
 | **Library** | Scans `/music` on the SD card (up to 3 sub-folder levels, 800 tracks). Drag-to-scroll list with kinetic (flick) scrolling; only the visible rows are drawn, so hundreds of songs cost almost no RAM. Tap a song to play. |
-| **Now playing** | 200x200 art area (generated cover per track), marquee title, artist, seek bar, elapsed / total time, vertical volume bar, prev / play-pause / next, playback mode (in order / repeat all / repeat one / shuffle), "next track" line, clock, battery or BT status. Swipe the art left/right for next/previous. |
+| **Now playing** | 200x200 art area (the song's real album cover, or a placeholder), marquee title, artist, seek bar, elapsed / total time, vertical volume bar, prev / play-pause / next, playback mode (in order / repeat all / repeat one / shuffle), "next track" line, clock, battery or BT status. Swipe the art left/right for next/previous. |
 | **Bluetooth** | A2DP source with auto-reconnect. First run opens a pairing picker; the chosen device is remembered and reconnected on every boot. |
 | **Theme** | 4 looks — **Dark** (original), Midnight, Slate, **Light** — plus 8 accent colours (Red, Blue, Purple, Green, Orange, Pink, Cyan, Gold). Changes apply instantly (no restart) and recolour the whole UI. |
-| **WiFi receiver** | Separate boot mode (see below): hotspot + captive portal + Telegram bot fetcher. MP3s the bot receives are saved to `/music/telegram/` on the SD card. |
+| **USB sync** | Separate boot mode (see below): the PC tool *MyPod Sync* sends songs + 200x200 covers over the USB cable straight to the SD card. |
 | **Power saving** | Brightness with gamma curve, auto-brightness via the onboard light sensor, screen-off timeout (drawing stops, music keeps playing), CPU speed 80/160/240 MHz, auto deep-sleep when idle, manual sleep / screen-off. |
 | **Touch** | XPT2046 resistive touch, bit-banged on its own pins, with a 3-target calibration on first boot. |
-| **Audio engine** | Helix MP3 decoder (fixed-point, CPU-friendly) on core 0 → PCM ring buffer → A2DP callback on the BT task. Sample rates are resampled on the fly. |
+| **Audio engine** | Helix MP3 decoder (fixed-point, CPU-friendly) pinned to **core 1** — away from the Bluetooth stack — fed from a compressed **read-ahead ring** (8-24 KB of MP3 buffered ahead of the card) → 6 KB PCM ring → A2DP callback on the BT task. Mono and 22/24/32/48 kHz files are resampled on the fly. |
 
 ## Hardware
 
@@ -88,10 +87,25 @@ repo get the patched code automatically:
    beforehand — which is why the app carries **no**
    `esp_bt_controller_mem_release` calls anywhere. The full analysis lives
    in the comment inside `bt_start()`.
+4. `BluetoothA2DPSource.cpp → handle_audio_state()` — the A2DP audio state is
+   stored even when no state callback is registered, so `get_audio_state()` is
+   always usable.
+5. `BluetoothA2DPSource.cpp → app_a2d_callback()` — the moment the headphones
+   connect the source asks the stack to start streaming
+   (`ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY`) instead of waiting up to 10 s for its
+   heartbeat timer.
+6. `BluetoothA2DPSource.cpp → handle_audio_state()` — if the sink suspends or
+   stops the stream while the state machine still believes it is STARTED, the
+   state is reset and streaming is re-requested (at most once a second).
+7. `src/btfix.cpp` (app-side, not part of the lib) complements the above:
+   it sets BR/EDR TX power to the maximum once the controller is up, and
+   re-asks the stack to start the stream after 2.5 s of silence while a track
+   is playing. Background and measurements: `AUDIO_CUTS_REPORT.md`;
+   the short summary: `BT_FIX.md`.
 
 TFT pins/flags are set in `platformio.ini` via `USER_SETUP_LOADED` — no
 `TFT_eSPI_User_Setup.h` needed. Flash layout is `huge_app.csv` (the firmware
-is ~2.1 MB with WiFi + TLS included).
+is well under 2 MB).
 
 ## First boot
 
@@ -128,6 +142,7 @@ state.
 | CPU speed | 160 MHz default; 80 MHz saves power (watch for audio glitches). |
 | Status LED | On = solid blue when headphones are connected, slow blink while searching, fully dark when disabled or the screen is off. |
 | Animations | Off = no slide when the track changes. |
+| Cover colours | Four modes — Normal / Swap red-blue / Invert / Swap + invert — for panels that draw the `/art` covers with wrong colours; each change repaints instantly. |
 | Auto power-off | Deep sleep after N idle minutes when not playing. Touch wakes it. |
 | Sleep now / Turn screen off now | Manual triggers for the above. |
 | Volume limit | Caps maximum volume (hearing protection). |
@@ -142,46 +157,26 @@ state.
 Both apply immediately. They are stored as their own NVS keys, so flashing
 new firmware never resets them and your other settings survive untouched.
 
-### WiFi receiver mode (Telegram → SD card)
+### USB sync (PC -> SD card)
 
-Because the normal player keeps little heap free (Bluetooth + the decoder), the
-receiver runs as a **separate boot mode** with Bluetooth left out —
-that frees enough RAM for TLS.
+Instead of pulling the card out, copy music over the USB cable you already use for flashing.
+USB sync is a **separate boot mode** (no Bluetooth, no player) so the whole RAM is free.
 
-Turning on **Settings → WIFI RECEIVER** restarts the pod into receiver mode:
+1. On the pod: **Settings -> USB SYNC -> Copy songs from PC (USB)...** -> *Restart*.
+   The screen shows "USB SYNC".
+2. On the PC: install Python 3.9+ and run `pip install -r pc_sync/requirements.txt`, then
+   `python pc_sync/mypod_sync.py` (details in `pc_sync/README.md`).
+3. Pick the pod's COM port, press **Connect**, **Add files / Add folder**, press **Send to iPod**.
+4. Press **Finish & start the player** (or hold BOOT for 3 s on the pod). The player re-scans
+   the card automatically and the new songs appear.
 
-1. The pod opens a hotspot **`MyPod-XXXX`**, password **`12345678`**
-   (shown on its screen).
-2. Connect a phone to that hotspot and open **http://192.168.4.1**:
-   - home WiFi **name + password**
-   - **Telegram bot token** (from [@BotFather](https://t.me/BotFather))
-3. Save — the pod joins your home network and long-polls the bot.
-4. Send an MP3 to your bot in Telegram (as a file or audio attachment).
-   It's saved to **`/music/telegram/`** on the SD card and you get a
-   confirmation message in the chat.
-5. Exit: hold the **BOOT** button 3 s, use the **/exit** button on the
-   status page, or type `exit` on the USB serial console. The pod restarts
-   back into the player; **Rescan music library** picks up the new songs.
+What gets copied: the MP3 (named `Artist - Title.mp3` from its tags, which is what the library
+list shows), its ID3 tags, and the album cover - converted on the PC to a 200x200 picture in
+`/art/` on the card, so the pod only has to stream a small file to the screen. Progressive/PNG
+covers work too, because the PC does the decoding.
 
-The status page (`/status`) auto-refreshes and shows connection state, token
-validity, SD-card presence and how many MP3s were received. The pod's screen
-shows the same status live.
-
-**Serial console** (115200) in receiver mode — handy when you don't want to
-use the phone portal:
-
-```
-exit                  leave receiver mode, boot the player
-info                  print status
-cred <ssid> <pass> <token>   set credentials directly
-```
-
-Notes:
-- Tokens and WiFi passwords are stored **only in the pod's NVS flash** — never
-  in this repository.
-- Files > 100 MB are refused; duplicate names get `_2`, `_3`… suffixes.
-- Without an SD card the receiver reports `SD CARD MISSING!` and retries.
-- The bot token is validated by Telegram: a bad one shows `token REFUSED`.
+The mode flag is stored in NVS, so if you power-cycle while the screen says USB SYNC it stays in
+that mode until you exit (PC button or BOOT held 3 s).
 
 ### SD card
 
@@ -198,20 +193,17 @@ FAT32. Put MP3s in `/music` (sub-folders up to 3 levels are scanned; if
 ## Architecture
 
 ```
-Playback:  SD (VSPI) -> Helix MP3 decoder (core 0 task) -> 6 KB PCM ring
-           -> A2DP callback (BT task) -> headphones
+Playback:  SD (VSPI) -> compressed read-ahead ring (8-24 KB of MP3)
+           -> Helix MP3 decoder (core 1) -> 6 KB PCM ring
+           -> A2DP callback (BT task, core 0) -> headphones
 UI:        TFT_eSPI immediate-mode drawing on core 1 (main loop), TFT over HSPI;
            list rows composed in one 240x40 sprite when RAM allows (else drawn directly)
 Touch:     XPT2046 bit-banged, own pins, 3-point calibration in NVS
-Receiver:  softAP + WebServer portal (AP_STA) + Telegram getUpdates poller
-           on a core-0 task; TLS via WiFiClientSecure (setInsecure)
+USB sync:  framed, CRC-checked serial protocol (src/usbsync_engine.h, stop-and-wait 4 KB
+           chunks) over the USB-UART bridge; PC side in pc_sync/
 ```
 
-**Why receiver mode exists as a separate boot:** the player boots with very
-little heap to spare (the Bluetooth stack and the MP3 decoder are resident). TLS needs
-tens of KB more. Rather than risk crashes, the WiFi/Telegram stack only runs
-when Bluetooth doesn't. The `wifi` NVS flag decides which mode boots;
-both modes flip the flag and restart when switching.
+**Why USB sync is a separate boot:** the player runs with very little spare heap (Bluetooth + decoder). USB sync does not need Bluetooth, so it simply never starts it and gets the full RAM; the `usb` NVS flag decides which mode boots.
 
 **RAM notes** (the ESP32 has 320 KB DRAM and BT + TLS both want it):
 
@@ -237,23 +229,23 @@ both modes flip the flag and restart when switching.
   and the decoder's minimum free stack once a song has played 4 seconds.
   Settings → System shows live free heap.
 
-Measured boot ledger (this exact firmware, headphones connected, 3 test
-tracks on the SD card):
+Measured boot ledger (this exact firmware — the USB-sync build, headphones
+connected, 2 tracks on the SD card, read-ahead enabled):
 
 | Step | Free heap after |
 |---|---|
-| Boot | ~200 KB |
-| SD mount + library index | ~168 KB |
-| Decoder pre-pin (Helix + buffers) | ~136 KB |
-| Ring + decoder task | ~123 KB |
-| BT init (BTDM), settled | ~31 KB |
-| Headphones connected | ~23 KB |
-| Playing | stable at a ~9–10 KB floor, no SBC assert |
+| Boot | ~221 KB |
+| SD mount + library index | ~189 KB |
+| Decoder pre-pin (Helix + buffers) | ~157 KB |
+| Ring + decoder task | ~144 KB |
+| BT init (BTDM), settled | ~51.6 KB |
+| Headphones connected + 12 KB read-ahead buffer | ~26 KB |
+| Playing | steady ~21 KB (min seen ~12.9 KB), underruns 0 |
 
 ## Troubleshooting
 
 - **`SD: not found` at boot** — check the card is FAT32 and seated; the
-  library will be empty and Telegram saves will fail.
+  library will be empty and USB sync cannot save songs.
 - **Pod restarts every few seconds, or when you pick a song** — heap
   exhaustion. Send the `[heap]` / `[player]` serial lines (115200 baud): they
   show where it ran out. The BT connect is gated: it waits for ≥ 24 KB free.
@@ -268,7 +260,13 @@ tracks on the SD card):
   some want `a2dp.start("")`. If the pair list stays empty, set
   `DEFAULT_BT_NAME` in `config.h` to your earphones' exact name.
 - **Auto-brightness backwards** — flip `LDR_DARK_IS_HIGH` in `config.h`.
-- **Audio stutter** — use CPU 160/240 MHz; raise `RING_BYTES` if heap allows.
+- **Audio stutter / 1-second cuts** — check the serial console counters first
+  (115200 baud): `[audio]` (ring fill, underruns, slowest SD read), `[bt]`
+  (callback pacing — a healthy link requests ~1720 calls per 5 s window; ~1170
+  means the radio link is the bottleneck), `[bts]` (connect/disconnect events)
+  and `[loop]` (UI-thread blocking). The fix and the measurements behind it
+  are in `BT_FIX.md` and `AUDIO_CUTS_REPORT.md`. Also use CPU 160/240 MHz and
+  don't cover the board's antenna area.
 - **Serial shows `rst:(DEEP_SLEEP)` resets on its own** — that is the auto
   power-off deep sleep after ~1 idle minute without playback (Settings →
   Auto power-off), not a crash. Touch wakes the pod again.
@@ -276,19 +274,41 @@ tracks on the SD card):
 
 ## Repository notes
 
+- `pc_sync/` — the PC-side **MyPod Sync** program that sends MP3 files (with
+  tags and album covers) to the iPod over USB; the firmware side is
+  `src/usbsync.*` + `src/usbsync_engine.h`.
+- `BT_FIX.md` — short guide to the Bluetooth audio-cut fix (what was patched
+  and which serial markers to expect).
+- `library.patch` — the exact diff applied to the vendored ESP32-A2DP library.
+- `AUDIO_CUTS_REPORT.md` — the full profiling report behind that fix
+  (instrumentation, measurements, root-cause analysis).
 - `.pio/` (build output, ~240 MB) and local logs are git-ignored.
-- No secrets are committed: hotspot password, WiFi credentials and bot tokens
-  are defaults or runtime NVS data on the device, not source content.
+- No secrets are committed or stored: there is no WiFi and no account of any kind.
 
 ## Known limits / ideas
 
 MP3 only (no FLAC/WAV/AAC yet) · VBR files with a Xing/Info header get exact
-durations, others are estimates · seek is byte-proportional · the album art
-shown is a generated placeholder (embedded cover decoding is a possible next
-step) · no playlists · battery gauge needs an external divider ·
-receiver downloads are sequential (one file at a time).
+durations, others are estimates · seek is byte-proportional · songs without an
+embedded cover keep the "Album Unavailable" placeholder · no playlists ·
+battery gauge needs an external divider · USB sync sends one file at a time.
 
 ## License
 
 Released under the [MIT License](LICENSE). The vendored libraries keep their
 upstream licenses — see the license files inside `lib/`.
+
+## Album covers
+
+The Now Playing screen shows a 200x200 cover from `/art/<hash>.cov` on the SD card (the hash is
+FNV-1a of the song's path). The PC tool creates these files from the cover embedded in each MP3;
+songs without one keep the "Album Unavailable" placeholder.
+
+## Audio buffering (why music no longer cuts out)
+
+Bluetooth asks for ~3.5 KB of audio every 20 ms, but the decoded-audio ring is only 6-16 KB
+(35-90 ms), so any SD-card stall (50-300 ms is normal for SPI cards) or a burst of Bluetooth
+work used to be heard as a cut. After Bluetooth connects, a reader task now keeps 8-24 KB of the
+*compressed* MP3 read ahead (about a second of music at 128 kbps), the decoder runs on core 1 away
+from the Bluetooth stack, and the CPU never drops below 240 MHz. The serial console prints a line
+every 5 s (`[audio] underruns=... mp3buf=... slowest SD read=... ms`) that shows exactly what is
+going on if you still hear a cut.

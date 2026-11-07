@@ -24,7 +24,7 @@ static bool sdReady = false;
 //                                  // base name ("file name" order)
 //
 // It is rewritten only when the library actually changes (Rescan button or
-// the receiver writing new files sets a dirty flag), so normal boots skip
+// USB sync adding files sets a dirty flag), so normal boots skip
 // the two-pass scan completely.
 
 static const char* IDX_PATH = "/music.idx";
@@ -219,7 +219,7 @@ void Library::begin() {
                 (unsigned)(preSd - ESP.getFreeHeap()));
   Serial.printf("SD: %s\n", sdReady ? "ok" : "not found");
   if (!sdReady) return;
-  bool rebuild = Cfg::libDirty();            // receiver downloaded new files
+  bool rebuild = Cfg::libDirty();            // USB sync added/removed files
   if (!rebuild) rebuild = !loadIdx();        // no (or broken/stale-format) index
   if (!rebuild && nTracks == 0) {            // empty index but not dirty: new
     rebuild = true;                          // files may have been copied by PC

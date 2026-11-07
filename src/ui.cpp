@@ -10,7 +10,8 @@
 #include "library.h"
 #include "player.h"
 #include "touch.h"
-#include "receiver.h"
+#include "usbsync.h"
+#include "art.h"
 #include <TFT_eSPI.h>
 
 #define T     (Hal::tft)
@@ -111,7 +112,7 @@ static void toast(const char* m, uint32_t ms = 2000) {
   drawToast();
 }
 
-enum DlgAct : uint8_t { DLG_NONE, DLG_PAIR, DLG_WIFI, DLG_RECAL };
+enum DlgAct : uint8_t { DLG_NONE, DLG_PAIR, DLG_USB, DLG_RECAL };
 static struct { bool open; DlgAct act; const char* title; const char* l1; const char* l2; } dlg;
 
 static bool dlgDrawPending = false;
@@ -136,7 +137,7 @@ static void drawDlg() {
 static void runDlg() {
   switch (dlg.act) {
     case DLG_PAIR:  S.pairNext = 1; Cfg::save(); break;
-    case DLG_WIFI:  Receiver::setEnabled(true); break;
+    case DLG_USB:   UsbSync::setEnabled(true); break;
     case DLG_RECAL: Touch::forgetCal(); Cfg::save(); break;
     default: return;
   }
@@ -229,6 +230,7 @@ static char npTitle[64] = "";
 static char npArtist[48] = "";
 static char npNext[40] = "";
 static uint32_t npSeed = 0;
+static int npCoverCur = -1;                          // track whose real cover is on screen
 static int npLastCur = -2;
 static uint32_t npLastSerial = 0xFFFFFFFF;
 static int npTitleW = 0;
@@ -278,6 +280,17 @@ static void npTop() {
 }
 
 static void drawArt(int xoff) {
+  // real album cover, when the PC tool put one on the card for this song (see art.h)
+  int cur = Player::current();
+  if (cur >= 0) {
+    const char* sp = Library::path(cur);
+    if (sp && sp[0] && Art::drawCover(T, sp, ART_X + xoff, ART_Y, ART_X, ART_X + ART_W)) {
+      T.drawRect(ART_X, ART_Y, ART_W, ART_H, C_TXT);
+      npCoverCur = cur;
+      return;
+    }
+  }
+  npCoverCur = -1;
   T.setViewport(ART_X, ART_Y, ART_W, ART_H, false);
   int hue = npSeed % 360;
   uint16_t c1 = hsv565(hue, 150, 170), c2 = hsv565((hue + 45) % 360, 190, 55);
@@ -297,7 +310,10 @@ static void drawArt(int xoff) {
 }
 
 static void npSlideArt(int dir) {                    // dir +1: new art enters from the right
-  if (!S.animations) { drawArt(0); return; }
+  // a real cover is an 80 KB read from the card: draw it once instead of 4 times while sliding
+  int cc = Player::current();
+  const char* sp = cc >= 0 ? Library::path(cc) : nullptr;
+  if (!S.animations || (sp && sp[0] && Art::exists(sp))) { drawArt(0); return; }
   static const int steps[] = {110, 170, 196, 200};
   for (int i = 0; i < 4; i++) {
     int off = dir * (ART_W - steps[i]);
@@ -433,7 +449,7 @@ static void npTick(uint32_t now) {
     bool trackChanged = (cur != npLastCur);
     npLastCur = cur; npLastSerial = ser;
     npFetchMeta();
-    if (trackChanged) npSlideArt(dir); else drawArt(0);
+    if (trackChanged) npSlideArt(dir); else if (npCoverCur != cur) drawArt(0);
     npTitleLine(true); npArtistLine(); npNextLine();
     marqHold = now + 1200;
   }
@@ -619,8 +635,8 @@ static void libRelease(int x, int y, bool tap) {
 enum IType : uint8_t { I_SECTION, I_TOGGLE, I_CYCLE, I_SLIDER, I_ACTION, I_INFO, I_COLOR };
 enum SId : uint8_t {
   SID_NONE, SID_SHUFFLE, SID_REPEAT, SID_VOLLIM, SID_BRIGHT, SID_AUTOB, SID_TIMEOUT, SID_SCROFF,
-  SID_CPU, SID_LED, SID_ANIM, SID_POWEROFF, SID_SLEEP, SID_LOOK, SID_ACCENT, SID_CLKH, SID_CLKM,
-  SID_BT, SID_PAIR, SID_WIFI, SID_RESCAN, SID_RECAL, SID_INFO1, SID_INFO2
+  SID_CPU, SID_COVCLR, SID_LED, SID_ANIM, SID_POWEROFF, SID_SLEEP, SID_LOOK, SID_ACCENT, SID_CLKH, SID_CLKM,
+  SID_BT, SID_PAIR, SID_USB, SID_RESCAN, SID_RECAL, SID_INFO1, SID_INFO2
 };
 struct Item { IType t; SId id; const char* label; };
 static const Item ITEMS[] = {
@@ -632,6 +648,7 @@ static const Item ITEMS[] = {
   {I_SLIDER,  SID_BRIGHT,   "Brightness"},
   {I_TOGGLE,  SID_AUTOB,    "Auto brightness"},
   {I_CYCLE,   SID_TIMEOUT,  "Screen off after"},
+  {I_CYCLE,   SID_COVCLR,   "Cover colours"},
   {I_ACTION,  SID_SCROFF,   "Turn screen off now"},
   {I_SECTION, SID_NONE, "POWER SAVING"},
   {I_CYCLE,   SID_CPU,      "CPU speed"},
@@ -648,8 +665,8 @@ static const Item ITEMS[] = {
   {I_SECTION, SID_NONE, "BLUETOOTH"},
   {I_INFO,    SID_BT,       "Headphones"},
   {I_ACTION,  SID_PAIR,     "Pair new headphones..."},
-  {I_SECTION, SID_NONE, "WIFI RECEIVER"},
-  {I_ACTION,  SID_WIFI,     "Receive songs via Telegram..."},
+  {I_SECTION, SID_NONE, "USB SYNC"},
+  {I_ACTION,  SID_USB,      "Copy songs from PC (USB)..."},
   {I_SECTION, SID_NONE, "SYSTEM"},
   {I_ACTION,  SID_RESCAN,   "Rescan music library"},
   {I_ACTION,  SID_RECAL,    "Recalibrate touch..."},
@@ -689,6 +706,7 @@ static void valueText(SId id, char* b, size_t n) {
     case SID_TIMEOUT:  strlcpy(b, TIMEOUT_TXT[S.timeoutIdx % 5], n); break;
     case SID_CPU:      strlcpy(b, CPU_TXT[S.cpuIdx % 3], n); break;
     case SID_POWEROFF: strlcpy(b, PO_TXT[S.powerOffIdx % 4], n); break;
+    case SID_COVCLR:   { static const char* const CC[4] = {"Normal", "Swap red/blue", "Invert", "Swap + invert"}; strlcpy(b, CC[Art::colorMode() & 3], n); break; }
     case SID_LOOK:     strlcpy(b, Th::LOOK_NAME[Th::look()], n); break;
     case SID_ACCENT:   strlcpy(b, Th::ACC_NAME[Th::accent()], n); break;
     case SID_CLKH: { int h = 0, m = 0; if (Hal::clockValid()) Hal::clockGet(h, m); snprintf(b, n, "%02d", h); break; }
@@ -707,6 +725,7 @@ static void cycleStep(SId id, int dir) {
     case SID_TIMEOUT:  S.timeoutIdx = wrap(S.timeoutIdx + dir, 5); Cfg::saveSoon(); break;
     case SID_CPU:      S.cpuIdx = wrap(S.cpuIdx + dir, 3); Hal::applyPower(); Cfg::saveSoon(); break;
     case SID_POWEROFF: S.powerOffIdx = wrap(S.powerOffIdx + dir, 4); Cfg::saveSoon(); break;
+    case SID_COVCLR:   Art::setColorMode(wrap(Art::colorMode() + dir, 4)); npCoverCur = -1; needFull = true; break;
     case SID_LOOK:     Th::setLook((uint8_t)wrap(Th::look() + dir, 4)); needFull = true; break;
     case SID_ACCENT:   Th::setAccent((uint8_t)wrap(Th::accent() + dir, 8)); needFull = true; break;
     case SID_CLKH: { int h = 12, m = 0; if (Hal::clockValid()) Hal::clockGet(h, m); Hal::clockSet(wrap(h + dir, 24), m); break; }
@@ -806,8 +825,8 @@ static void setActivate(int idx, int x) {
           if (Player::scanMode()) go(SC_PICK);
           else openDlg(DLG_PAIR, "Pair headphones", "Restarts to search for", "Bluetooth headphones.");
           break;
-        case SID_WIFI:
-          openDlg(DLG_WIFI, "WiFi receiver", "Restarts into a WiFi hotspot", "to receive songs via Telegram.");
+        case SID_USB:
+          openDlg(DLG_USB, "USB sync", "Restarts so the PC tool can", "copy songs over USB.");
           break;
         case SID_RESCAN: doRescan(); break;
         case SID_RECAL:  openDlg(DLG_RECAL, "Touch calibration", "Restarts, then tap three", "targets on the screen.");

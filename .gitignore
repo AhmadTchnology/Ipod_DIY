@@ -20,3 +20,7 @@ fl_log.txt
 # OS / editor noise
 Thumbs.db
 .DS_Store
+
+# Python bytecode (pc_sync)
+__pycache__/
+*.pyc

@@ -46,8 +46,8 @@ void Cfg::tick() {
   if (dirty && millis() - dirtyAt > 2000) save();
 }
 
-// library-changed flag, kept directly in NVS so the receiver task can set it
-// and the next pod boot (which doesn't run the receiver) picks it up
+// library-changed flag, kept directly in NVS so USB sync mode can set it
+// and the next player boot picks it up
 void Cfg::setLibDirty(bool v) {
   Preferences p;
   p.begin("mypod", false);

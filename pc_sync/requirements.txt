@@ -1,0 +1,5 @@
+pyserial>=3.5
+mutagen>=1.47
+Pillow>=10.0
+# optional, makes Arabic / Cyrillic / CJK titles readable on the iPod's ASCII-only font:
+unidecode>=1.3
