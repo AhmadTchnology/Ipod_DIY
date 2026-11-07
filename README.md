@@ -311,3 +311,7 @@ work used to be heard as a cut. After Bluetooth connects, a reader task now keep
 from the Bluetooth stack, and the CPU never drops below 240 MHz. The serial console prints a line
 every 5 s (`[audio] underruns=... mp3buf=... slowest SD read=... ms`) that shows exactly what is
 going on if you still hear a cut.
+
+---
+
+### Made With ❤️ By AhmadTchnology
