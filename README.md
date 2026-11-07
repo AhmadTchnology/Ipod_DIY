@@ -100,8 +100,8 @@ repo get the patched code automatically:
 7. `src/btfix.cpp` (app-side, not part of the lib) complements the above:
    it sets BR/EDR TX power to the maximum once the controller is up, and
    re-asks the stack to start the stream after 2.5 s of silence while a track
-   is playing. Background and measurements: `AUDIO_CUTS_REPORT.md`;
-   the short summary: `BT_FIX.md`.
+   is playing. With these fixes the pump rate measured 1169 → 1717 data
+   callbacks per 5 s window (~68% → ~100% of real-time audio).
 
 TFT pins/flags are set in `platformio.ini` via `USER_SETUP_LOADED` — no
 `TFT_eSPI_User_Setup.h` needed. Flash layout is `huge_app.csv` (the firmware
@@ -264,9 +264,9 @@ connected, 2 tracks on the SD card, read-ahead enabled):
   (115200 baud): `[audio]` (ring fill, underruns, slowest SD read), `[bt]`
   (callback pacing — a healthy link requests ~1720 calls per 5 s window; ~1170
   means the radio link is the bottleneck), `[bts]` (connect/disconnect events)
-  and `[loop]` (UI-thread blocking). The fix and the measurements behind it
-  are in `BT_FIX.md` and `AUDIO_CUTS_REPORT.md`. Also use CPU 160/240 MHz and
-  don't cover the board's antenna area.
+  and `[loop]` (UI-thread blocking). The fixes themselves are the vendored-lib
+  patches above plus `src/btfix.cpp`. Also use CPU 160/240 MHz and don't
+  cover the board's antenna area.
 - **Serial shows `rst:(DEEP_SLEEP)` resets on its own** — that is the auto
   power-off deep sleep after ~1 idle minute without playback (Settings →
   Auto power-off), not a crash. Touch wakes the pod again.
@@ -277,11 +277,8 @@ connected, 2 tracks on the SD card, read-ahead enabled):
 - `pc_sync/` — the PC-side **MyPod Sync** program that sends MP3 files (with
   tags and album covers) to the iPod over USB; the firmware side is
   `src/usbsync.*` + `src/usbsync_engine.h`.
-- `BT_FIX.md` — short guide to the Bluetooth audio-cut fix (what was patched
-  and which serial markers to expect).
-- `library.patch` — the exact diff applied to the vendored ESP32-A2DP library.
-- `AUDIO_CUTS_REPORT.md` — the full profiling report behind that fix
-  (instrumentation, measurements, root-cause analysis).
+- `library.patch` — the exact diff applied to the vendored ESP32-A2DP library
+  for the Bluetooth audio-cut fix.
 - `.pio/` (build output, ~240 MB) and local logs are git-ignored.
 - No secrets are committed or stored: there is no WiFi and no account of any kind.
 

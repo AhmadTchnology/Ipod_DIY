@@ -1,4 +1,4 @@
-// Bluetooth link helpers, called from Player::update() (see lib patch notes in BT_FIX.md).
+// Bluetooth link helpers, called from Player::update() (patch notes in library.patch / README).
 #pragma once
 #include <Arduino.h>
 #include <BluetoothA2DPSource.h>
