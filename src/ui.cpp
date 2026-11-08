@@ -179,7 +179,9 @@ static bool sprTried = false;
 static void sprAcquire() {
   if (rowSpr || sprTried) return;
   sprTried = true;
-  if (ESP.getFreeHeap() < 48000 || ESP.getMaxAllocHeap() < 24000) return;   // tight on RAM: draw rows directly
+  // The 19 KB row sprite starves the Bluetooth stack of heap (it needs ~37 KB free to connect and start
+  // streaming), so it is effectively disabled: rows are drawn directly. Lower the limit only on a roomy heap.
+  if (ESP.getFreeHeap() < 200000 || ESP.getMaxAllocHeap() < 24000) return;
   TFT_eSprite* s = new TFT_eSprite(&T);
   s->setColorDepth(16);
   if (s->createSprite(SCR_W, 40)) rowSpr = s; else delete s;

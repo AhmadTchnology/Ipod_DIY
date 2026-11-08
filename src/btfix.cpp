@@ -10,14 +10,15 @@ void tick(BluetoothA2DPSource& a2dp, bool wantAudio) {
   uint32_t now = millis();
 
   // 1) Radio: the profiling report shows the stack pumps audio at ~68 % of real time, i.e. the
-  //    link only carries ~30 KB/s. Use the maximum BR/EDR transmit power (+9 dBm) so the sink
-  //    needs fewer retransmissions. (Default is lower; needs the controller to be enabled.)
+  //    link only carries ~30 KB/s. Espressif's default BR/EDR power range is N0..P3 (0..+3 dBm);
+  //    allow up to +9 dBm. Keeping min at the default leaves the controller's power control in
+  //    charge (it only goes high when the link is weak). Needs the controller to be enabled.
   if (!powerDone && esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) {
-    esp_err_t r = esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9);
+    esp_err_t r = esp_bredr_tx_power_set(ESP_PWR_LVL_N0, ESP_PWR_LVL_P9);
     powerDone = (r == ESP_OK);
     esp_power_level_t lo = ESP_PWR_LVL_N12, hi = ESP_PWR_LVL_N12;
     esp_bredr_tx_power_get(&lo, &hi);
-    Serial.printf("[bt] BR/EDR tx power set -> %s (now min=%d max=%d, level 7 = +9 dBm)\n",
+    Serial.printf("[bt] BR/EDR tx power set -> %s (now min=%d max=%d, max level 7 = +9 dBm)\n",
                   r == ESP_OK ? "ok" : "FAILED", (int)lo, (int)hi);
   }
 

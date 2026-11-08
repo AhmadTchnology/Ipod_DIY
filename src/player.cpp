@@ -16,17 +16,24 @@
 #include "config.h"
 #include "settings.h"
 #include "library.h"
+#include "btfix.h"
 #include <SD.h>
 #include <esp_bt.h>
 #include <esp_timer.h>
 #include <BluetoothA2DPSource.h>
-#include "btfix.h"
 #include <libhelix-mp3/mp3dec.h>     // Helix C API (extern "C")
 
 // ring growth after the Bluetooth link is up (see Player::maybeGrowRing)
 #define RING_GROW_BYTES  (16 * 1024)     // biggest ring we ever try (~90 ms of audio)
 #define RING_GROW_MIN    (10 * 1024)     // smallest worthwhile growth
 #define RING_KEEP_FREE   (44 * 1024)     // PCM ring growth only on a roomy heap (normally it stays 6 KB)
+
+// IMPORTANT - measured on the device (see README "Audio buffering"): the Bluetooth stack needs the heap.
+// With the read-ahead buffer, PCM ring growth and the list sprite all active, free heap fell to ~21 KB and
+// the stack pulled only ~68 % of real-time audio (cuts every 1-2 s). With them OFF (34-38 KB free while
+// playing) it pulls 100 % for minutes. The decoder and SD card never starved, so these buffers only cost
+// memory. Leave this at 0 unless the player gets a lot more free heap.
+#define ENABLE_HEAP_HUNGRY_BUFFERS 0
 
 // compressed read-ahead: a task keeps this many bytes of the MP3 file buffered, so an SD-card
 // stall (50-300 ms is normal for SPI cards) no longer starves the decoder. 16 KB of MP3 is about
@@ -125,12 +132,6 @@ static volatile uint32_t g_underruns = 0;  // BT callback found the ring short w
 static volatile uint32_t g_maxDecUs = 0;   // slowest single MP3 frame decode since last report
 static volatile uint32_t g_maxSdUs = 0;    // slowest SD read since last report
 static volatile uint32_t g_starves = 0;    // decoder had to wait for file data
-// BT callback pacing diagnostics (odd audio "cuts" investigation)
-static volatile uint32_t g_btCalls = 0;    // callbacks since last report
-static volatile uint32_t g_btBytes = 0;    // PCM bytes consumed from the ring since last report
-static volatile uint32_t g_maxBtGapUs = 0; // biggest gap between two callbacks
-static volatile uint32_t g_btcOver = 0;    // callbacks more than 20 ms after the previous one
-static volatile uint32_t g_lastBtUs = 0;   // timestamp of the previous callback
 static volatile bool g_rdBroken = false;   // read-ahead stopped delivering: went back to direct reads
 static volatile bool g_openFailed = false; // decoder could not open the file (reported from update())
 static uint32_t g_openAt = 0;              // millis() when the current track was requested
@@ -521,12 +522,6 @@ static void decodeTask(void*) {
 
 // ---------------------------------------------------------------- Bluetooth side
 static int32_t a2dpData(Frame* out, int32_t frames) {
-  uint32_t tUs = (uint32_t)esp_timer_get_time();
-  uint32_t gap = g_lastBtUs ? tUs - g_lastBtUs : 0;
-  g_lastBtUs = tUs;
-  if (gap > g_maxBtGapUs) g_maxBtGapUs = gap;
-  if (gap > 20000) g_btcOver++;
-  g_btCalls++;
   size_t need = (size_t)frames * 4;
   if (g_paused || !g_loaded || g_switching) {
     memset(out, 0, need);                        // keep the link alive with silence
@@ -544,8 +539,7 @@ static int32_t a2dpData(Frame* out, int32_t frames) {
     }
   }
   size_t got = ring.read((uint8_t*)out, need);
-  if (got < need) g_underruns++;
-  g_btBytes += got;
+  if (got < need && !g_eof) g_underruns++;
   int16_t* s = (int16_t*)out;
   size_t cnt = got / 2;
   uint32_t g = g_gainQ8;
@@ -719,7 +713,7 @@ void seek(float frac) {
 
 // The ring starts small (6 KB) because the Bluetooth connect needs the heap. Once the
 // link is up and the heap has recovered, widen it: more cushion against SD / BT hiccups.
-static void maybeGrowRing() {
+__attribute__((unused)) static void maybeGrowRing() {
   static uint8_t tries = 0;
   static uint32_t last = 0;
   if (tries >= 8 || ring.sz >= RING_GROW_BYTES) return;
@@ -744,7 +738,7 @@ static void maybeGrowRing() {
 }
 
 // Allocate the compressed read-ahead once the Bluetooth link is up and the heap has recovered.
-static void maybeEnableReadAhead() {
+__attribute__((unused)) static void maybeEnableReadAhead() {
   static uint8_t tries = 0;
   static uint32_t last = 0;
   if (useCring || g_rdBroken || tries >= 8 || !g_decOk) return;
@@ -782,23 +776,10 @@ void update() {
   static bool probed = false;
   static uint32_t lastDiag = 0, lastUr = 0, lastSt = 0;
   BtFix::tick(a2dp, g_loaded && !g_paused);
-  {                         // BT link flap logger: the "plays a second, then buffers" signature
-    static bool wasConn = false, first = true;
-    static uint32_t lastPoll = 0;
-    uint32_t now2 = millis();
-    if (now2 - lastPoll > 200) {
-      lastPoll = now2;
-      bool conn = a2dp.is_connected();
-      if (first || conn != wasConn) {
-        first = false;
-        Serial.printf("[bts] %lu ms: bt %s\n", (unsigned long)now2,
-                      conn ? "CONNECTED" : "DISCONNECTED");
-        wasConn = conn;
-      }
-    }
-  }
+#if ENABLE_HEAP_HUNGRY_BUFFERS
   maybeEnableReadAhead();
   maybeGrowRing();
+#endif
   if (g_openFailed) {
     g_openFailed = false;
     Serial.printf("[player] could not open/decode the file (heap free=%u)\n", (unsigned)ESP.getFreeHeap());
@@ -822,18 +803,13 @@ void update() {
     lastDiag = millis();
     uint32_t ur = g_underruns;
     uint32_t st = g_starves;
-    uint32_t calls = g_btCalls, bytes = g_btBytes;
-    uint32_t maxGap = g_maxBtGapUs, over = g_btcOver;
     Serial.printf("[audio] underruns=%u (+%u) pcm=%u/%u mp3buf=%u/%u | slowest decode=%lu ms, slowest SD read=%lu ms, decoder waited for data +%u | heap free=%u\n",
                   (unsigned)ur, (unsigned)(ur - lastUr), (unsigned)ring.n, (unsigned)ring.sz,
                   (unsigned)(useCring ? cring.n : 0), (unsigned)(useCring ? cring.sz : 0),
                   (unsigned long)(g_maxDecUs / 1000), (unsigned long)(g_maxSdUs / 1000),
                   (unsigned)(st - lastSt), (unsigned)ESP.getFreeHeap());
-    Serial.printf("[bt] calls=%u bytes=%u maxGap=%luus over20ms=%u\n",
-                  (unsigned)calls, (unsigned)bytes, (unsigned long)maxGap, (unsigned)over);
     lastUr = ur; lastSt = st;
     g_maxDecUs = 0; g_maxSdUs = 0;
-    g_btCalls = 0; g_btBytes = 0; g_maxBtGapUs = 0; g_btcOver = 0;
   }
   if (!g_loaded || g_switching) return;
   if (g_fail) {                                  // unreadable file: skip, but don't loop forever

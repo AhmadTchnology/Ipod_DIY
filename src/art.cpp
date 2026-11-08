@@ -2,7 +2,6 @@
 #include "config.h"
 #include "library.h"
 #include "arthash.h"
-#include <esp_timer.h>
 #include <SD.h>
 #include <Preferences.h>
 
@@ -51,7 +50,6 @@ static inline int imax(int a, int b) { return a > b ? a : b; }
 
 
 bool drawCover(TFT_eSPI& g, const char* song, int x, int y, int clipX0, int clipX1) {
-  uint32_t dc0 = (uint32_t)esp_timer_get_time();
   char cp[40];
   artCachePath(song, cp, sizeof(cp));
   Hdr hd;
@@ -98,8 +96,6 @@ bool drawCover(TFT_eSPI& g, const char* song, int x, int y, int clipX0, int clip
   g.setSwapBytes(oldSwap);
   free(buf);
   Library::sdEnter(); f.close(); Library::sdExit();
-  uint32_t dc = (uint32_t)esp_timer_get_time() - dc0;
-  if (dc > 25000) Serial.printf("[art] drawCover took %luus\n", (unsigned long)dc);
   return complete;
 }
 

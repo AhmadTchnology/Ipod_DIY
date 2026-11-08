@@ -30,7 +30,7 @@ Bluetooth earphones.
 | **USB sync** | Separate boot mode (see below): the PC tool *MyPod Sync* sends songs + 200x200 covers over the USB cable straight to the SD card. |
 | **Power saving** | Brightness with gamma curve, auto-brightness via the onboard light sensor, screen-off timeout (drawing stops, music keeps playing), CPU speed 80/160/240 MHz, auto deep-sleep when idle, manual sleep / screen-off. |
 | **Touch** | XPT2046 resistive touch, bit-banged on its own pins, with a 3-target calibration on first boot. |
-| **Audio engine** | Helix MP3 decoder (fixed-point, CPU-friendly) pinned to **core 1** — away from the Bluetooth stack — fed from a compressed **read-ahead ring** (8-24 KB of MP3 buffered ahead of the card) → 6 KB PCM ring → A2DP callback on the BT task. Mono and 22/24/32/48 kHz files are resampled on the fly. |
+| **Audio engine** | Helix MP3 decoder (fixed-point, CPU-friendly) pinned to **core 1** — away from the Bluetooth stack — → 6 KB PCM ring → A2DP callback on the BT task. Mono and 22/24/32/48 kHz files are resampled on the fly. |
 
 ## Hardware
 
@@ -99,7 +99,8 @@ repo get the patched code automatically:
    stops the stream while the state machine still believes it is STARTED, the
    state is reset and streaming is re-requested (at most once a second).
 7. `src/btfix.cpp` (app-side, not part of the lib) complements the above:
-   it sets BR/EDR TX power to the maximum once the controller is up, and
+   it raises the BR/EDR TX-power ceiling to +9 dBm once the controller is up
+   (the controller's own power control stays in charge below the ceiling), and
    re-asks the stack to start the stream after 2.5 s of silence while a track
    is playing. With these fixes the pump rate measured 1169 → 1717 data
    callbacks per 5 s window (~68% → ~100% of real-time audio).
@@ -194,11 +195,11 @@ FAT32. Put MP3s in `/music` (sub-folders up to 3 levels are scanned; if
 ## Architecture
 
 ```
-Playback:  SD (VSPI) -> compressed read-ahead ring (8-24 KB of MP3)
-           -> Helix MP3 decoder (core 1) -> 6 KB PCM ring
+Playback:  SD (VSPI) -> Helix MP3 decoder (core 1) -> 6 KB PCM ring
            -> A2DP callback (BT task, core 0) -> headphones
 UI:        TFT_eSPI immediate-mode drawing on core 1 (main loop), TFT over HSPI;
-           list rows composed in one 240x40 sprite when RAM allows (else drawn directly)
+           list rows drawn directly (a 240x40 sprite path exists but is gated off —
+           its 19 KB costs the Bluetooth stack heap it needs to connect)
 Touch:     XPT2046 bit-banged, own pins, 3-point calibration in NVS
 USB sync:  framed, CRC-checked serial protocol (src/usbsync_engine.h, stop-and-wait 4 KB
            chunks) over the USB-UART bridge; PC side in pc_sync/
@@ -231,7 +232,7 @@ USB sync:  framed, CRC-checked serial protocol (src/usbsync_engine.h, stop-and-w
   Settings → System shows live free heap.
 
 Measured boot ledger (this exact firmware — the USB-sync build, headphones
-connected, 2 tracks on the SD card, read-ahead enabled):
+connected, extra buffers disabled, see "Audio buffering" below):
 
 | Step | Free heap after |
 |---|---|
@@ -240,8 +241,8 @@ connected, 2 tracks on the SD card, read-ahead enabled):
 | Decoder pre-pin (Helix + buffers) | ~157 KB |
 | Ring + decoder task | ~144 KB |
 | BT init (BTDM), settled | ~51.6 KB |
-| Headphones connected + 12 KB read-ahead buffer | ~26 KB |
-| Playing | steady ~21 KB (min seen ~12.9 KB), underruns 0 |
+| Headphones connected + first track open | ~43 KB |
+| Playing | 34-38 KB steady (brief dip to ~24 KB in the first seconds), underruns 0 |
 
 ## Troubleshooting
 
@@ -261,13 +262,15 @@ connected, 2 tracks on the SD card, read-ahead enabled):
   some want `a2dp.start("")`. If the pair list stays empty, set
   `DEFAULT_BT_NAME` in `config.h` to your earphones' exact name.
 - **Auto-brightness backwards** — flip `LDR_DARK_IS_HIGH` in `config.h`.
-- **Audio stutter / 1-second cuts** — check the serial console counters first
-  (115200 baud): `[audio]` (ring fill, underruns, slowest SD read), `[bt]`
-  (callback pacing — a healthy link requests ~1720 calls per 5 s window; ~1170
-  means the radio link is the bottleneck), `[bts]` (connect/disconnect events)
-  and `[loop]` (UI-thread blocking). The fixes themselves are the vendored-lib
-  patches above plus `src/btfix.cpp`. Also use CPU 160/240 MHz and don't
-  cover the board's antenna area.
+- **Audio stutter / 1-second cuts** — the Bluetooth stack again gets the dump
+  first: it needs heap. Health lines on the serial console (115200 baud):
+  `[audio]` every 5 s (ring fill, underruns, slowest SD read), `[heap]` for
+  the first 90 s, `[player] 4s in:` (decoder stack). The big buffers
+  (compressed read-ahead, enlarged PCM ring, list sprite) are disabled by
+  design — `ENABLE_HEAP_HUNGRY_BUFFERS 0` in `src/player.cpp` and the sprite
+  gate in `src/ui.cpp` — because the stack can't connect below ~28 KB free
+  and pumps only ~68 % of real time when squeezed. Also use CPU 160/240 MHz
+  and don't cover the board's antenna area.
 - **Serial shows `rst:(DEEP_SLEEP)` resets on its own** — that is the auto
   power-off deep sleep after ~1 idle minute without playback (Settings →
   Auto power-off), not a crash. Touch wakes the pod again.
@@ -302,15 +305,33 @@ The Now Playing screen shows a 200x200 cover from `/art/<hash>.cov` on the SD ca
 FNV-1a of the song's path). The PC tool creates these files from the cover embedded in each MP3;
 songs without one keep the "Album Unavailable" placeholder.
 
-## Audio buffering (why music no longer cuts out)
+## Audio buffering (why music used to cut out)
 
-Bluetooth asks for ~3.5 KB of audio every 20 ms, but the decoded-audio ring is only 6-16 KB
-(35-90 ms), so any SD-card stall (50-300 ms is normal for SPI cards) or a burst of Bluetooth
-work used to be heard as a cut. After Bluetooth connects, a reader task now keeps 8-24 KB of the
-*compressed* MP3 read ahead (about a second of music at 128 kbps), the decoder runs on core 1 away
-from the Bluetooth stack, and the CPU never drops below 240 MHz. The serial console prints a line
-every 5 s (`[audio] underruns=... mp3buf=... slowest SD read=... ms`) that shows exactly what is
-going on if you still hear a cut.
+Measured on the device with a minimal tone-only test (`bt_pump_test`) and the
+player's own live readings, then made permanent in the firmware:
+
+* The Bluetooth stack (ESP-IDF Bluedroid) pulls audio from the app; the player's
+  decoder and SD card were never the bottleneck (buffers full, underruns 0).
+  But the stack needs heap: below ~28 KB free it cannot even connect, just
+  above that streaming starts unreliably, and when extra buffers squeezed the
+  heap to ~21 KB the stack pulled only **~68 % of real-time audio** — the cut
+  every 1-2 s.
+* Once streaming, the pump keeps 100 % even down to ~23 KB free, so
+  steady-state memory is not the problem — **connect/start is**. That is why
+  `ENABLE_HEAP_HUNGRY_BUFFERS 0` in `src/player.cpp` keeps the compressed
+  read-ahead and PCM-ring growth compiled out, and `src/ui.cpp` keeps the
+  list-row sprite off: the player now opens a track with ~43 KB free and
+  plays at 34-38 KB, and the link establishes fast and pumps 100 % for
+  minutes.
+* The vendored ESP32-A2DP library is patched so streaming starts right after
+  the link comes up (it used to wait for a 10 s heartbeat) and restarts if the
+  sink suspends the stream; `src/btfix.cpp` raises the BR/EDR TX-power ceiling
+  and re-asks for the stream if it is not running.
+* The decoder runs pinned to core 1 (away from the Bluetooth stack) and the
+  CPU is kept at 240 MHz while playing.
+* Do not re-enable big buffers without re-measuring
+  (`ENABLE_HEAP_HUNGRY_BUFFERS 1`). If a cut ever returns, the serial console
+  prints `[audio]` / `[heap]` / `[player]` health lines for diagnosis.
 
 ---
 
