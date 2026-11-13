@@ -23,7 +23,7 @@ Bluetooth earphones.
 
 | Area | What you get |
 |---|---|
-| **Library** | Scans `/music` on the SD card (up to 3 sub-folder levels, 800 tracks). Drag-to-scroll list with kinetic (flick) scrolling; only the visible rows are drawn, so hundreds of songs cost almost no RAM. Tap a song to play. |
+| **Library** | Scans `/music` on the SD card (up to 3 sub-folder levels, 800 tracks). Drag-to-scroll list with kinetic (flick) scrolling; only the visible rows are drawn, so hundreds of songs cost almost no RAM. Tap a song to play. **Full Unicode song names & tags** — Arabic, French, Chinese, Japanese, Korean, Cyrillic, etc. (see [Unicode support](#unicode-support)). |
 | **Now playing** | 200x200 art area (the song's real album cover, or a placeholder), marquee title, artist, seek bar, elapsed / total time, vertical volume bar, prev / play-pause / next, playback mode (in order / repeat all / repeat one / shuffle), "next track" line, clock, battery or BT status. Swipe the art left/right for next/previous. |
 | **Bluetooth** | A2DP source with auto-reconnect. First run opens a pairing picker; the chosen device is remembered and reconnected on every boot. |
 | **Theme** | 4 looks — **Dark** (original), Midnight, Slate, **Light** — plus 8 accent colours (Red, Blue, Purple, Green, Orange, Pink, Cyan, Gold). Changes apply instantly (no restart) and recolour the whole UI. |
@@ -187,10 +187,34 @@ FAT32. Put MP3s in `/music` (sub-folders up to 3 levels are scanned; if
 
 - Best: **44.1 kHz, stereo, 128–256 kbps MP3**. Mono and 22/24/32/48 kHz
   files are resampled on the fly.
-- Title/artist come from ID3v2.3/2.4 tags, otherwise from
+- Title/artist come from ID3v2.3/2.4 tags (all 4 encodings decoded to UTF-8), otherwise from
   `Artist - Title.mp3` file names.
-- Only ASCII is drawn (the built-in fonts have no Arabic/CJK glyphs); other
-  characters display as `?`.
+- **Full Unicode rendering** — Arabic (with proper shaping/ligatures), French/accented Latin, Chinese/Japanese/Korean, Cyrillic, etc. The built-in pixel fonts stay for English; Unicode text uses a custom bitmap atlas (Arial/YaHei UI Light/Malgun) sized to visually match the built-in style.
+
+## Unicode support
+
+The firmware now renders song names and artist tags in their original scripts — no more `?` for non-ASCII characters.
+
+| Script | Example | Notes |
+|---|---|---|
+| Arabic | متكبره - حسام | Full shaping (isolated/final/initial/medial), mandatory lam-alef ligatures, Allah ligature (U+FDF2) rule validated 47/47 vs `arabic-reshaper` |
+| French / accented Latin | Été À Paris — Café | All Latin-1 + Latin-Ext-A rendered |
+| Chinese (Simplified) | 八方来财 | Microsoft YaHei UI Light bitmap subset |
+| Japanese | こんにちは | Hiragana/Katakana from YaHei UI Light |
+| Korean | 정줄 | Malgun Gothic bitmap subset |
+| Cyrillic | Привет | Arial bitmap subset |
+
+**How it works:**
+
+- **ID3 tags** — All four ID3 text encodings (ISO-8859-1, UTF-16, UTF-16BE, UTF-8) are now decoded to UTF-8 correctly (previously non-ASCII was mangled to `?`).
+- **Arabic shaping** — The renderer mirrors `arabic-reshaper` (config: `delete_harakat: True`, `support_ligatures: True`). Contextual forms and lam-alef ligatures are produced on-device; the Allah word ligature (U+FDF2) appears only when valid.
+- **Bidi** — A lightweight UAX#9 implementation: base direction from the first strong character; RTL runs reversed, LTR runs (Latin + Arabic-Indic digits) restored.
+- **Bitmap atlas** — Arial (Latin/Greek/Cyrillic/Arabic) at 16 px title / 9 px artist, Microsoft YaHei UI Light (CJK + kana), Malgun Gothic (Hangul). Sizes chosen so cap heights match the built-in font2 (11 px) and font1 (7 px); non-Arabic glyphs get +1 px letter spacing so text doesn't look cramped; all glyph ink is clipped to the line band so no pixel slivers escape cleared areas.
+- **English stays native** — ASCII-only lines use the built-in TFT_eSPI pixel fonts exactly as before; only lines containing non-ASCII use the atlas. The visual style is identical.
+- **Race fix** — The UI and decoder task share `g_title`/`g_artist`; a seqlock (`g_metaSeq`) prevents the "leftover line" bug where a mid-write read showed the new title followed by the old one's tail.
+- **PC sync** — The protocol and FAT-safe naming preserve UTF-8 end-to-end; cover hashes are computed over raw UTF-8 path bytes.
+
+The atlas generator lives at `tools/gen_unifont.py` (requires PIL, arabic-reshaper, fontTools). It validates the shaping table against `arabic-reshaper`, emits `src/unifont_data.h`, and produces a preview PNG simulating the pod's Now Playing screen.
 
 ## Architecture
 
