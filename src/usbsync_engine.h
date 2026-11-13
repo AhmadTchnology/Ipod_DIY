@@ -77,7 +77,9 @@ static inline bool endsCI(const char* s, const char* suf) {
 static inline bool okChars(const char* p) {
   for (; *p; p++) {
     unsigned char c = (unsigned char)*p;
-    if (c < 0x20 || c > 0x7E || strchr("\"*:<>?|\\", c)) return false;
+    // bytes >= 0x80 are UTF-8 continuation/lead bytes - allowed. Still block
+    // control chars, DEL and the FAT-reserved ASCII set ('?' mangles too).
+    if (c < 0x20 || c == 0x7F || strchr("\"*:<>?|\\", c)) return false;
   }
   return true;
 }

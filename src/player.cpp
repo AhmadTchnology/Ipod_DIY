@@ -138,7 +138,8 @@ static uint32_t g_openAt = 0;              // millis() when the current track wa
 static uint32_t decGen = 0;
 static uint32_t g_aStart = 0, g_aEnd = 0;
 static int g_cur = -1;
-static char g_title[64], g_artist[48];
+static char g_title[96], g_artist[64];
+static volatile uint32_t g_metaSeq = 0;    // seqlock: odd = g_title/g_artist update in flight
 static int g_hist[16];
 static int g_histN = 0;
 static char g_err[40] = "";
@@ -197,35 +198,80 @@ static void emitPcm(const short* pcm, int total, int ch, int rate) {
 }
 
 // ---------------------------------------------------------------- ID3v2 (title/artist) + audio start
+// Decodes any ID3v2 text encoding into UTF-8 (controls -> space). The renderer
+// in unitext.h handles the rest; ASCII output looks exactly like before.
 static void id3Text(const uint8_t* d, size_t n, char* out, size_t on) {
   out[0] = 0;
   if (n < 2) return;
   uint8_t enc = d[0]; d++; n--;
   size_t o = 0;
-  if (enc == 0 || enc == 3) {                   // Latin-1 / UTF-8
-    for (size_t i = 0; i < n && o + 1 < on; i++) {
+  auto put = [&](uint32_t cp) {                       // UTF-8 encode one codepoint
+    if (o + 5 > on) return false;
+    if (cp < 32) cp = ' ';
+    if (cp < 0x80) out[o++] = (char)cp;
+    else if (cp < 0x800) {
+      out[o++] = (char)(0xC0 | (cp >> 6)); out[o++] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+      out[o++] = (char)(0xE0 | (cp >> 12));
+      out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[o++] = (char)(0x80 | (cp & 0x3F));
+    } else {
+      out[o++] = (char)(0xF0 | (cp >> 18));
+      out[o++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+      out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[o++] = (char)(0x80 | (cp & 0x3F));
+    }
+    return true;
+  };
+  if (enc == 0) {                                     // Latin-1
+    for (size_t i = 0; i < n; i++) {
+      if (d[i] == 0) break;
+      if (!put(d[i])) break;
+    }
+  } else if (enc == 3) {                              // UTF-8: pass through, fix controls
+    for (size_t i = 0; i < n; i++) {
       uint8_t c = d[i];
       if (c == 0) break;
-      if (c < 0x80) out[o++] = c >= 32 ? c : ' ';
-      else if (c >= 0xC0) out[o++] = '?';
+      if (c < 0x80) { if (!put(c)) break; }
+      else if (o + 1 < on) out[o++] = c;
     }
-  } else {                                      // UTF-16
+  } else {                                            // UTF-16 (1 = LE/BOM, 2 = BE)
     bool be = (enc == 2);
     size_t i = 0;
     if (enc == 1 && n >= 2) {
       if (d[0] == 0xFF && d[1] == 0xFE) { be = false; i = 2; }
       else if (d[0] == 0xFE && d[1] == 0xFF) { be = true; i = 2; }
     }
-    for (; i + 1 < n && o + 1 < on; i += 2) {
-      uint16_t ch = be ? ((d[i] << 8) | d[i + 1]) : ((d[i + 1] << 8) | d[i]);
-      if (ch == 0) break;
-      out[o++] = ch < 0x80 ? (ch >= 32 ? (char)ch : ' ') : '?';
+    while (i + 1 < n) {
+      uint16_t u = be ? (uint16_t)(((uint16_t)d[i] << 8) | d[i + 1])
+                      : (uint16_t)(((uint16_t)d[i + 1] << 8) | d[i]);
+      i += 2;
+      if (u == 0) break;
+      uint32_t cp = u;
+      if (u >= 0xD800 && u <= 0xDBFF && i + 1 < n) {  // high surrogate: pair with the low one
+        uint16_t lo = be ? (uint16_t)(((uint16_t)d[i] << 8) | d[i + 1])
+                         : (uint16_t)(((uint16_t)d[i + 1] << 8) | d[i]);
+        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+          cp = 0x10000u + (((u - 0xD800u) << 10) | (lo - 0xDC00u));
+          i += 2;
+        }
+      }
+      if (!put(cp)) break;
     }
   }
   out[o] = 0;
 }
 
 static uint8_t id3Tmp[400];                     // static: keeps the decoder task's stack small
+
+// Publish new title/artist atomically. The UI (meta()) re-reads g_metaSeq after
+// copying and retries while a write is in flight, so it can never draw a torn
+// string (new text followed by the tail of the previous one).
+static void metaStore(bool hasT, const char* t, bool hasA, const char* a) {
+  uint32_t s = g_metaSeq + 1;
+  g_metaSeq = s;                                // odd: readers must retry
+  if (hasT) strlcpy(g_title, t, sizeof(g_title));
+  if (hasA) strlcpy(g_artist, a, sizeof(g_artist));
+  g_metaSeq = s + 1;                            // even: consistent again
+}
 
 static uint32_t id3Parse(File& f) {
   uint8_t h[10];
@@ -236,7 +282,7 @@ static uint32_t id3Parse(File& f) {
   uint32_t end = 10 + size;
   bool ext = h[5] & 0x40;
   if ((ver == 3 || ver == 4) && !ext) {
-    char t[64] = {0}, a[48] = {0};
+    char t[96] = {0}, a[64] = {0};
     uint32_t pos = 10;
     while (pos + 10 <= end) {
       uint8_t fh[10];
@@ -253,8 +299,7 @@ static uint32_t id3Parse(File& f) {
       }
       pos += 10 + fs;
     }
-    if (t[0]) strlcpy(g_title, t, sizeof(g_title));
-    if (a[0]) strlcpy(g_artist, a, sizeof(g_artist));
+    metaStore(t[0] != 0, t, a[0] != 0, a);
   }
   return end;
 }
@@ -585,7 +630,9 @@ static void startTrack(int idx, bool pushHist) {
     g_hist[g_histN++] = g_cur;
   }
   g_cur = idx;
-  Library::displayName(idx, g_title, sizeof(g_title), g_artist, sizeof(g_artist));
+  char t[96], a[64];
+  Library::displayName(idx, t, sizeof(t), a, sizeof(a));
+  metaStore(true, t, true, a);
   Cmd c;
   c.type = CMD_OPEN; c.frac = 0;
   strlcpy(c.path, p, sizeof(c.path));
@@ -868,8 +915,15 @@ void setShuffle(bool on) { S.shuffle = on; Cfg::saveSoon(); }
 void setRepeat(uint8_t m) { S.repeat = m; Cfg::saveSoon(); }
 
 void meta(char* title, size_t tn, char* artist, size_t an) {
-  strlcpy(title, g_title, tn);
-  strlcpy(artist, g_artist, an);
+  for (int i = 0; i < 30; i++) {              // seqlock reader (see metaStore)
+    uint32_t s = g_metaSeq;
+    if (!(s & 1)) {
+      strlcpy(title, g_title, tn);
+      strlcpy(artist, g_artist, an);
+      if (g_metaSeq == s) return;             // no write started during the copy
+    }
+    delay(1);                                 // decode task is mid-update: retry
+  }
 }
 
 bool btConnected() { return a2dp.is_connected(); }

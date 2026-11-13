@@ -229,7 +229,7 @@ class Device:
             size = os.path.getsize(source)
             fh = open(source, "rb")
         try:
-            p = dev_path.encode("ascii")
+            p = dev_path.encode("utf-8")
             self.request(CMD_PUT_BEGIN, struct.pack("<IB", size, len(p)) + p, timeout=10)
             crc = 0
             off = 0
@@ -260,14 +260,14 @@ class Device:
             rcmd, rpl = self._next_frame(15)
             if rcmd == R_LISTENT and len(rpl) > 5:
                 size, has = struct.unpack("<IB", rpl[:5])
-                songs.append({"path": rpl[5:].decode("ascii", "replace"), "size": size, "cover": bool(has)})
+                songs.append({"path": rpl[5:].decode("utf-8", "replace"), "size": size, "cover": bool(has)})
             elif rcmd == R_LISTDONE:
                 return songs
             elif rcmd == R_ERROR:
                 raise DeviceError(rpl[1] if len(rpl) > 1 else 0, rpl[2:].decode("ascii", "replace"))
 
     def delete(self, dev_path):
-        self.request(CMD_DELETE, dev_path.encode("ascii"), timeout=10)
+        self.request(CMD_DELETE, dev_path.encode("utf-8"), timeout=10)
 
     def exit_to_player(self):
         try:

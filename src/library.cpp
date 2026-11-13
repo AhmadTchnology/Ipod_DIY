@@ -310,12 +310,12 @@ const char* Library::path(int i) {
   return pathBuf;
 }
 
-static void asciiCopy(const char* s, size_t len, char* out, size_t n) {
+static void rawCopy(const char* s, size_t len, char* out, size_t n) {
   size_t o = 0;
   for (size_t i = 0; i < len && o + 1 < n; i++) {
-    uint8_t c = s[i];
-    if (c < 0x80) out[o++] = c < 32 ? ' ' : c;
-    else if (c >= 0xC0) out[o++] = '?';     // lead byte of a multi-byte char
+    uint8_t c = (uint8_t)s[i];
+    if (c == 0) break;
+    out[o++] = c < 32 ? ' ' : (char)c;      // UTF-8 bytes pass through untouched
   }
   out[o] = 0;
 }
@@ -326,8 +326,8 @@ void Library::displayName(int i, char* title, size_t tn, char* artist, size_t an
   const char* b = baseName(relBuf);
   size_t len = strlen(b);
   if (len > 4) len -= 4;                       // strip .mp3
-  char tmp[96];
-  asciiCopy(b, len, tmp, sizeof(tmp));
+  char tmp[PATH_MAX_LEN];
+  rawCopy(b, len, tmp, sizeof(tmp));
   for (char* p = tmp; *p; p++) if (*p == '_') *p = ' ';
   char* sep = strstr(tmp, " - ");
   if (sep) {

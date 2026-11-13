@@ -193,10 +193,37 @@ def main():
     check(ok, "odd baud rates refused")
 
     # --- names
-    check(M.device_name("Beyoncé", "Halo (Live)", "x") == "Beyonce - Halo (Live)", "accents transliterated")
+    check(M.device_name("Beyoncé", "Halo (Live)", "x") == "Beyoncé - Halo (Live)", "accents kept (pod renders Unicode now)")
     check(M.device_name("", "", "my?bad:file*name") == "my bad file name", "illegal characters removed")
     check(M.device_name("", "", "***") == "Track", "empty name falls back")
     check(len(M.device_name("a" * 200, "b" * 200, "x")) <= 143, "long names are bounded")
+    check(M.device_name("حسام الرسام", "متكبره", "x") == "حسام الرسام - متكبره", "Arabic artist/title kept")
+    check(M.device_name("", "", "a\u0001b") == "a b", "control characters removed")
+    check(len(M.device_name("ح" * 100, "", "x").encode("utf-8")) <= 70, "byte cap holds for Arabic")
+    check(M.device_name("", "", "攬佬SKAI ISYOURGOD") == "攬佬SKAI ISYOURGOD", "CJK kept")
+
+    # --- Unicode filenames end to end: the pod stores and hashes UTF-8 bytes
+    uni_song = "/music/حسام الرسام - متكبره.mp3"
+    dev.put(uni_song, b"u" * 5000)
+    check(open(os.path.join(root, "music", "حسام الرسام - متكبره.mp3"), "rb").read() == b"u" * 5000,
+          "Arabic-named song stored byte-exact")
+    check(any(s["path"] == uni_song for s in dev.list_songs()), "LIST returns the Arabic name as UTF-8")
+    ucp = M.cover_dev_path(uni_song)
+    srcu = ('#include "../../src/arthash.h"\n#include <stdio.h>\nint main(){char o[40];char p[]=' +
+            "".join('"\\x%02x"' % b for b in uni_song.encode("utf-8")) +
+            ';artCachePath(p,o,40);puts(o);}')
+    spu = os.path.join(tempfile.gettempdir(), "hu.cpp"); open(spu, "w").write(srcu)
+    subprocess.run(["g++", "-I", HERE, "-x", "c++", "-o", spu + ".x", spu], check=True, capture_output=True)
+    outu = subprocess.run([spu + ".x"], capture_output=True, text=True).stdout.strip()
+    check(outu == ucp, f"PC and device agree on the UTF-8 cover file name ({outu})")
+    dev.put(ucp, blob)
+    dev.delete(uni_song)
+    check(not os.path.exists(os.path.join(root, "music", "حسام الرسام - متكبره.mp3")), "Arabic-named song deleted")
+    try:
+        dev.put("/music/bad?name.mp3", b"x"); ok = False
+    except P.DeviceError:
+        ok = True
+    check(ok, "'?' still refused")
 
     # --- mp3 tag + cover extraction and strip (needs mutagen)
     try:

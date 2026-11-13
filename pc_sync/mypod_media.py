@@ -7,13 +7,8 @@ import shutil
 import struct
 import sys
 import tempfile
-import unicodedata
 
 COVER_PX = 200
-try:
-    from unidecode import unidecode as _unidecode
-except Exception:            # optional: romanises Arabic/Cyrillic/CJK for the iPod's ASCII font
-    _unidecode = None
 
 
 def fnv1a(path_bytes):
@@ -24,24 +19,20 @@ def fnv1a(path_bytes):
 
 
 def cover_dev_path(song_dev_path):
-    return "/art/%08x.cov" % fnv1a(song_dev_path.encode("ascii"))
-
-
-def to_ascii(s):
-    if not s:
-        return ""
-    if _unidecode:
-        return _unidecode(s)
-    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-
-
-_BAD = re.compile(r"[^A-Za-z0-9 _.,'()&+!#%@$=~\[\]-]")
+    # fnv1a over the UTF-8 bytes the pod stores for the path (ASCII names hash identically)
+    return "/art/%08x.cov" % fnv1a(song_dev_path.encode("utf-8"))
 
 
 def clean_name(s, limit=70):
-    s = _BAD.sub(" ", to_ascii(s))
+    """Device filename for a song: keep Unicode (the pod renders it), but drop
+    characters FAT forbids and cap the byte length for the 8.3/LFN-safe path."""
+    if not s:
+        return ""
+    s = re.sub(r"[\x00-\x1f\x7f\"*/:<>?|\\]", " ", s)      # FAT-illegal + DEL
     s = re.sub(r"\s+", " ", s).strip(" .")
-    return s[:limit].strip(" .")
+    while len(s.encode("utf-8")) > limit:                  # cap bytes, not chars
+        s = s[:-1].rstrip(" .")
+    return s.strip(" .")
 
 
 def device_name(artist, title, stem):

@@ -12,6 +12,7 @@
 #include "touch.h"
 #include "usbsync.h"
 #include "art.h"
+#include "unitext.h"
 #include <TFT_eSPI.h>
 
 #define T     (Hal::tft)
@@ -39,8 +40,31 @@ static bool active = true;
 static bool needFull = true;
 
 // ------------------------------------------------------------------ small helpers
+// ASCII text keeps the built-in TFT fonts (the classic look); lines containing
+// Unicode render from the bitmap atlas instead. The atlas clear rect spans the
+// padded width and all datums, so no longer previous text can peek out.
 static void txt(TFT_eSPI& g, const char* s, int x, int y, uint8_t font, uint8_t size,
                 uint16_t fg, uint16_t bg, uint8_t datum = TL_DATUM, int pad = 0) {
+  if (Uni::hasUni(s)) {                       // Unicode line: bitmap atlas renderer
+    int h = Uni::lineH(font, size);
+    int w = Uni::width(s, h);
+    int cw = pad > w ? pad : w;               // clear at least the padded width
+    int x0 = x, y0 = y;
+    switch (datum) {                          // datum -> top-left of the line box
+      case TC_DATUM: x0 = x - cw / 2; x -= w / 2; break;
+      case TR_DATUM: x0 = x - cw; x -= w; break;
+      case ML_DATUM: y0 = y - h / 2; break;
+      case MC_DATUM: x0 = x - cw / 2; x -= w / 2; y0 = y - h / 2; break;
+      case MR_DATUM: x0 = x - cw; x -= w; y0 = y - h / 2; break;
+      case BL_DATUM: y0 = y - h; break;
+      case BC_DATUM: x0 = x - cw / 2; x -= w / 2; y0 = y - h; break;
+      case BR_DATUM: x0 = x - cw; x -= w; y0 = y - h; break;
+      default: break;                         // TL
+    }
+    g.fillRect(x0, y0, cw, h, bg);
+    Uni::draw(g, s, x, y0, h, fg, 0, SCR_W);
+    return;
+  }
   g.setTextFont(font);
   g.setTextSize(size);
   g.setTextColor(fg, bg);
@@ -54,12 +78,32 @@ static void clip(char* dst, const char* src, size_t maxChars) {   // copy, ".." 
   size_t n = strlen(src);
   if (n <= maxChars) { strcpy(dst, src); return; }
   if (maxChars < 3) { dst[0] = 0; return; }
-  memcpy(dst, src, maxChars - 2);
-  dst[maxChars - 2] = '.'; dst[maxChars - 1] = '.'; dst[maxChars] = 0;
+  size_t cut = maxChars - 2;
+  while (cut > 0 && ((uint8_t)src[cut] & 0xC0) == 0x80) cut--;    // keep UTF-8 sequences whole
+  memcpy(dst, src, cut);
+  dst[cut] = '.'; dst[cut + 1] = '.'; dst[cut + 2] = 0;
 }
 
 // shorten to fit maxPx for the given built-in font, ending in ".." when cut
 static void fitText(TFT_eSPI& g, const char* s, uint8_t font, int maxPx, char* out, size_t outN) {
+  if (Uni::hasUni(s)) {                       // Unicode line: atlas metrics
+    int h = Uni::lineH(font, 1);
+    size_t full = strlen(s);
+    size_t n = full;
+    if (n > outN - 3) n = outN - 3;
+    while (n > 0 && n < full && ((uint8_t)s[n] & 0xC0) == 0x80) n--;   // never cut inside a UTF-8 sequence
+    if (n == full) {
+      strlcpy(out, s, outN);
+      if (Uni::width(out, h) <= maxPx) return;
+    }
+    for (; n > 0; n--) {
+      if (n < full && ((uint8_t)s[n] & 0xC0) == 0x80) continue;
+      snprintf(out, outN, "%.*s..", (int)n, s);
+      if (Uni::width(out, h) <= maxPx) return;
+    }
+    strlcpy(out, "..", outN);
+    return;
+  }
   g.setTextFont(font);
   g.setTextSize(1);
   strlcpy(out, s, outN);
@@ -228,9 +272,9 @@ static bool stepKinetic(ListView& L, uint32_t now, int viewH) {
 }
 
 // ================================================================== NOW PLAYING
-static char npTitle[64] = "";
-static char npArtist[48] = "";
-static char npNext[40] = "";
+static char npTitle[96] = "";
+static char npArtist[64] = "";
+static char npNext[64] = "";
 static uint32_t npSeed = 0;
 static int npCoverCur = -1;                          // track whose real cover is on screen
 static int npLastCur = -2;
@@ -332,12 +376,38 @@ static void npVol() {
 }
 
 static void npArtistLine() {
+  // clear the whole 12px band: the built-in font1 clear is only 8px tall, which
+  // would leave a horizontal slice of a previous Unicode artist above the bar
+  T.fillRect(TITLE_X, ARTIST_Y, TITLE_W, UniFont::H_SMALL, C_BG);
+  if (Uni::hasUni(npArtist)) {
+    char b[104];
+    fitText(T, npArtist[0] ? npArtist : "Unknown artist", 1, TITLE_W, b, sizeof(b));
+    txt(T, b, TITLE_X, ARTIST_Y, 1, 1, C_DIM, C_BG, TL_DATUM, TITLE_W);
+    return;
+  }
   char b[36];
   clip(b, npArtist[0] ? npArtist : "Unknown artist", 33);
   txt(T, b, TITLE_X, ARTIST_Y, 1, 1, C_DIM, C_BG, TL_DATUM, TITLE_W);
 }
 
 static void npTitleLine(bool forceStatic) {
+  // clear the whole 19px band: the built-in font2 clear is only 16px tall, which
+  // would leave a bottom slice of a previous Unicode title under the new one
+  T.fillRect(TITLE_X, TITLE_Y, TITLE_W, UniFont::H_BIG, C_BG);
+  if (Uni::hasUni(npTitle)) {
+    npTitleW = Uni::width(npTitle, UniFont::H_BIG);
+    if (npTitleW <= TITLE_W) {
+      txt(T, npTitle, TITLE_X, TITLE_Y, 1, 2, C_TXT, C_BG, TL_DATUM, TITLE_W);
+      marq = 0;
+      return;
+    }
+    if (forceStatic) marq = 0;
+    int total = npTitleW + 36;                       // title + 36 px gap (pixel marquee)
+    int off = (int)marq % total;
+    Uni::draw(T, npTitle, TITLE_X - off, TITLE_Y, UniFont::H_BIG, C_TXT,
+              TITLE_X, TITLE_X + TITLE_W);
+    return;
+  }
   npTitleW = (int)strlen(npTitle) * 12;
   if (npTitleW <= TITLE_W) {
     txt(T, npTitle, TITLE_X, TITLE_Y, 1, 2, C_TXT, C_BG, TL_DATUM, TITLE_W);
@@ -404,8 +474,9 @@ static void npModeLine() {
 }
 
 static void npNextLine() {
-  char b[32];
+  char b[68];
   txt(T, "Next Track:", 20, NEXT_Y, 1, 1, C_DIM, C_BG);
+  T.fillRect(92, NEXT_Y, 144, UniFont::H_SMALL, C_BG);   // full band: covers the taller Uni line
   fitText(T, npNext[0] ? npNext : "-", 1, 142, b, sizeof(b));
   txt(T, b, 92, NEXT_Y, 1, 1, C_TXT, C_BG, TL_DATUM, 144);
 }
@@ -421,7 +492,7 @@ static void npFetchMeta() {
     npNext[0] = 0;
   } else {
     int ni = Player::nextIndex();
-    if (ni >= 0) { char a[8]; Library::displayName(ni, npNext, sizeof(npNext), a, sizeof(a)); }
+    if (ni >= 0) { char a[48]; Library::displayName(ni, npNext, sizeof(npNext), a, sizeof(a)); }
     else strlcpy(npNext, S.shuffle ? "Shuffle" : "End of list", sizeof(npNext));
   }
   uint32_t h = 5381;
@@ -542,7 +613,7 @@ static ListView lib;
 static const int LIB_HDR = 32, LIB_ROWH = 40;
 static const int LIB_LIST_H = SCR_H - LIB_HDR;
 
-struct NameEnt { int idx; char title[36]; char artist[28]; };
+struct NameEnt { int idx; char title[64]; char artist[48]; };
 static NameEnt nameCache[12];
 
 static void nameCacheClear() { for (auto& e : nameCache) e.idx = -1; }
@@ -559,7 +630,7 @@ static void libRow(TFT_eSPI& g, int y, int idx, bool pressed) {
   uint16_t bgc = pressed ? C_SU2 : C_BG;
   g.fillRect(0, y, SCR_W, LIB_ROWH, bgc);
   if (cur) g.fillRect(0, y + 4, 3, LIB_ROWH - 8, C_ACC);
-  char tb[44], ab[36];
+  char tb[70], ab[52];
   fitText(g, e.title, 2, 200, tb, sizeof(tb));
   fitText(g, e.artist[0] ? e.artist : "Unknown artist", 1, 200, ab, sizeof(ab));
   txt(g, tb, 12, y + 4, 2, 1, cur ? C_ACC : C_TXT, bgc);

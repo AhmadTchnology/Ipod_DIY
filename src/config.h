@@ -35,7 +35,7 @@
 // ---- Music / audio ----
 #define MUSIC_DIR     "/music"
 #define MAX_TRACKS    800
-#define PATH_MAX_LEN  128
+#define PATH_MAX_LEN  192                   // UTF-8 names are longer (Arabic ~2 B/char)
 #define RING_BYTES    (6 * 1024)      // PCM ring between decoder and BT callback
                                       // (MyPod runs OK on 6 KB; 16 KB ate ~10 KB
                                       // that SBC + fopen need at play start)
