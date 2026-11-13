@@ -85,6 +85,31 @@ The *On the iPod* tab lists what is on the card and lets you delete songs (their
   goes to the card (your original is never touched) - transfers are faster and the card stays small.
 * Songs with the same name and size that are already on the card are skipped.
 
+## Cover quality
+
+The pod shows covers on a small 200x200 panel that only stores 5 bits of red / 6 of green / 5 of
+blue per pixel. The converter takes that seriously:
+
+* **Colour profiles are honoured.** Embedded ICC profiles (Adobe RGB, Display P3, CMYK) are
+  converted to sRGB before resizing, so pro-photo covers stop looking washed out.
+* **Proper rounding + dithering.** Values are *rounded* to the panel's levels (pure white
+  stays pure white) with Floyd-Steinberg error diffusion, so gradients and skin tones stay
+  smooth instead of banding. Near-white (246+) and near-black (5-) pixels are snapped to
+  pure white / black first, so pale JPEG background mush doesn't turn into visible grain.
+* **Light sharpening** compensates for the blur of shrinking the picture (can't be turned off;
+  it is calibrated so flat areas stay flat).
+* **Cover colour boost** — the *Songs to send* tab has a spinbox (default **1.25**, range
+  1.0-2.0) that lifts saturation; the little screen tends to look flat otherwise. The cover
+  preview and any *Send* use the value currently in the box.
+
+### Freshening up covers that are already on the iPod
+
+Music sent with an older version (or a lower boost) keeps its old, duller cover because songs
+that are already on the card are skipped. To refresh only the pictures: **add the same MP3
+files again**, tick *"Also re-send the covers of songs that are already on the iPod"*, pick a
+boost value and press **Send to iPod** — the songs themselves are still skipped, only their
+cover files are replaced.
+
 ## Speed
 
 Default 921600 baud (about 60-90 KB/s, a 5 MB song in roughly a minute). "1500000" / "2000000" are faster on

@@ -77,6 +77,26 @@ void earlyInit() {
   ledcAttachPin(PIN_BL, 0);
   ledcWrite(0, 0);
   tft.init();
+#if TFT_GAMMA_FIX == 1
+  // gamma fix reported for this board: select gamma curve 2, then curve 1
+  tft.writecommand(0x26); tft.writedata(2);
+  delay(120);
+  tft.writecommand(0x26); tft.writedata(1);
+#elif TFT_GAMMA_FIX == 2
+  // fallback: full ST7789-style gamma tables (positive 0xE0, negative 0xE1),
+  // then select gamma curve 1. Values are the common ST7789V recommended set.
+  tft.writecommand(0xE0);
+  tft.writedata(0xD0); tft.writedata(0x08); tft.writedata(0x11); tft.writedata(0x08);
+  tft.writedata(0x0C); tft.writedata(0x15); tft.writedata(0x09); tft.writedata(0x07);
+  tft.writedata(0x0E); tft.writedata(0x08); tft.writedata(0x0F); tft.writedata(0x07);
+  tft.writedata(0x07); tft.writedata(0x0F);
+  tft.writecommand(0xE1);
+  tft.writedata(0xD0); tft.writedata(0x08); tft.writedata(0x11); tft.writedata(0x08);
+  tft.writedata(0x0C); tft.writedata(0x15); tft.writedata(0x09); tft.writedata(0x07);
+  tft.writedata(0x0E); tft.writedata(0x08); tft.writedata(0x0F); tft.writedata(0x07);
+  tft.writedata(0x07); tft.writedata(0x0F);
+  tft.writecommand(0x26); tft.writedata(1);
+#endif
   tft.setRotation(TFT_ROT);
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);

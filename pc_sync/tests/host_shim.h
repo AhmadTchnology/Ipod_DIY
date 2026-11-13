@@ -9,6 +9,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+// MinGW has no BSD strlcpy (src/usbsync_engine.h uses it) - host-build fallback.
+static inline size_t strlcpy(char* dst, const char* src, size_t n) {
+  size_t len = strlen(src);
+  if (n) { size_t c = len < n - 1 ? len : n - 1; memcpy(dst, src, c); dst[c] = 0; }
+  return len;
+}
+#endif
+
 #define PATH_MAX_LEN 128
 #define FILE_READ "rb"
 #define FILE_WRITE "wb"
@@ -58,7 +67,11 @@ struct SDClass {
     File f(fp, r, p); f.root_ = root; return f;
   }
   bool exists(const char* p) { struct stat st; return stat(real(p).c_str(), &st) == 0; }
+#ifdef _WIN32
+  bool mkdir(const char* p) { return ::mkdir(real(p).c_str()) == 0; }        // MinGW CRT: mkdir takes no mode
+#else
   bool mkdir(const char* p) { return ::mkdir(real(p).c_str(), 0755) == 0; }
+#endif
   bool remove(const char* p) { return ::remove(real(p).c_str()) == 0; }
   bool rename(const char* a, const char* b) { return ::rename(real(a).c_str(), real(b).c_str()) == 0; }
   uint64_t cardSize() { return 8ULL << 30; }

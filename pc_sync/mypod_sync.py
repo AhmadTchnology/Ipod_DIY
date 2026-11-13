@@ -124,11 +124,21 @@ class App(tk.Tk):
         opt.pack(fill="x")
         self.strip_var = tk.BooleanVar(value=True)
         self.skip_var = tk.BooleanVar(value=True)
+        self.recover_var = tk.BooleanVar(value=False)
+        self.sat_var = tk.DoubleVar(value=1.25)
         ttk.Checkbutton(opt, variable=self.strip_var,
                         text="Remove the big embedded picture from the MP3 copy (faster, saves card space; "
                              "the cover is still sent and shown on the iPod)").pack(anchor="w")
         ttk.Checkbutton(opt, variable=self.skip_var,
                         text="Skip songs that are already on the iPod (same name and size)").pack(anchor="w")
+        ttk.Checkbutton(opt, variable=self.recover_var,
+                        text="Also re-send the covers of songs that are already on the iPod "
+                             "(add the same files again to refresh old covers)").pack(anchor="w")
+        satf = ttk.Frame(opt)
+        satf.pack(anchor="w", pady=(2, 0))
+        ttk.Label(satf, text="Cover colour boost (1.0 = original, the iPod's small screen looks flat):").pack(side="left")
+        ttk.Spinbox(satf, from_=1.0, to=2.0, increment=0.05, width=5, format="%.2f",
+                    textvariable=self.sat_var, command=self._on_select).pack(side="left", padx=6)
 
         # --- tab 2: YouTube search -> add to the send list
         ty = ttk.Frame(nb, padding=6)
@@ -579,6 +589,13 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         self.tracks = []
 
+    def _sat(self):
+        """Clamped cover colour boost from the spinbox (1.0-2.0)."""
+        try:
+            return max(1.0, min(2.0, float(self.sat_var.get())))
+        except Exception:
+            return 1.25
+
     def _on_select(self, _e=None):
         sel = self.tree.selection()
         if not sel:
@@ -592,7 +609,7 @@ class App(tk.Tk):
         try:
             if i["cover"]:
                 from PIL import ImageTk
-                img = M.blob_to_image(M.make_cover_blob(i["cover"], 0))
+                img = M.blob_to_image(M.make_cover_blob(i["cover"], 0, saturation=self._sat()))
                 self.preview_img = ImageTk.PhotoImage(img)
                 self.cover_lbl.configure(image=self.preview_img, text="")
             else:
@@ -684,6 +701,7 @@ class App(tk.Tk):
             return
         self.cancel_flag = False
         strip, skip = self.strip_var.get(), self.skip_var.get()
+        recover, sat = self.recover_var.get(), self._sat()   # GUI-thread: tk vars are not thread-safe
 
         def job():
             dev = self.dev
@@ -703,6 +721,7 @@ class App(tk.Tk):
                 return
             sent, there, failed = run_batch(          # phase 2: transfer
                 dev, to_send, strip, skip, lambda: self.cancel_flag,
+                force_covers=recover, saturation=sat,
                 on_row=lambda i, s: self.q.put(("row", i, s)),
                 on_progress=lambda *a: self.q.put(("progress",) + a),
                 say=self.say)
@@ -727,6 +746,7 @@ class App(tk.Tk):
             return
         paths = [self.dev_tree.item(i, "values")[0] for i in self.dev_tree.selection()]
         if not paths:
+            messagebox.showinfo(APP, "Select one or more songs in the list above first.")
             return
         if not messagebox.askyesno(APP, f"Delete {len(paths)} song(s) from the iPod's SD card?"):
             return

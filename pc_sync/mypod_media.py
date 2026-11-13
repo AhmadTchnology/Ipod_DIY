@@ -1,5 +1,6 @@
 """Reads MP3 tags, builds the iPod-friendly file name and the 200x200 RGB565 cover."""
 import array
+import io
 import os
 import re
 import shutil
@@ -83,18 +84,91 @@ def read_info(path):
     return info
 
 
-def make_cover_blob(cover_bytes, mp3_size):
-    """Any JPEG/PNG/... -> 16-byte header + 200x200 RGB565 (little endian), centre-cropped square."""
-    from PIL import Image
-    import io
-    im = Image.open(io.BytesIO(cover_bytes)).convert("RGB")
+def _to_srgb(im):
+    """Honour an embedded colour profile: Adobe RGB / Display P3 / CMYK covers look
+    washed out if their ICC profile is ignored. Falls back to a plain RGB convert."""
+    try:
+        if im.info.get("icc_profile"):
+            from PIL import ImageCms
+            src = ImageCms.ImageCmsProfile(io.BytesIO(im.info["icc_profile"]))
+            im = ImageCms.profileToProfile(im, src, ImageCms.createProfile("sRGB"),
+                                           outputMode="RGB")
+        return im.convert("RGB")
+    except Exception:
+        return im.convert("RGB")
+
+
+def _rgb565_dithered(raw, w, h):
+    out = [0] * (w * h)
+    rl = [i * 255 / 31.0 for i in range(32)]
+    gl = [i * 255 / 63.0 for i in range(64)]
+    errR = [0.0] * (w + 2)
+    errG = [0.0] * (w + 2)
+    errB = [0.0] * (w + 2)
+    for y in range(h):
+        nR = [0.0] * (w + 2)
+        nG = [0.0] * (w + 2)
+        nB = [0.0] * (w + 2)
+        base = y * w * 3
+        rng = range(w) if y % 2 == 0 else range(w - 1, -1, -1)
+        d = 1 if y % 2 == 0 else -1
+        for x in rng:
+            i = base + x * 3
+            r = raw[i] + errR[x + 1]
+            g = raw[i + 1] + errG[x + 1]
+            b = raw[i + 2] + errB[x + 1]
+            qr = int(r * 31 / 255 + 0.5); qr = 0 if qr < 0 else (31 if qr > 31 else qr)
+            qg = int(g * 63 / 255 + 0.5); qg = 0 if qg < 0 else (63 if qg > 63 else qg)
+            qb = int(b * 31 / 255 + 0.5); qb = 0 if qb < 0 else (31 if qb > 31 else qb)
+            er, eg, eb = r - rl[qr], g - gl[qg], b - rl[qb]
+            xn = x + 1 + d
+            errR[xn] += er * 0.4375; errG[xn] += eg * 0.4375; errB[xn] += eb * 0.4375
+            nR[x + 1 - d] += er * 0.1875; nG[x + 1 - d] += eg * 0.1875; nB[x + 1 - d] += eb * 0.1875
+            nR[x + 1] += er * 0.3125; nG[x + 1] += eg * 0.3125; nB[x + 1] += eb * 0.3125
+            nR[xn] += er * 0.0625; nG[xn] += eg * 0.0625; nB[xn] += eb * 0.0625
+            out[y * w + x] = (qr << 11) | (qg << 5) | qb
+        errR, errG, errB = nR, nG, nB
+    return out
+
+
+def make_cover_blob(cover_bytes, mp3_size, saturation=1.25, sharpen=True, dither=True):
+    """Any JPEG/PNG/... -> 16-byte header + 200x200 RGB565 (little endian), centre-cropped
+    square. The pod's panel only stores 5/6/5 bits per channel, so the conversion rounds
+    properly (white -> 0xFFFF) and Floyd-Steinberg dithers instead of truncating; a light
+    unsharp plus an optional colour boost bring back what the small screen flattens."""
+    from PIL import Image, ImageEnhance, ImageFilter
+    im = Image.open(io.BytesIO(cover_bytes))
+    im.load()
+    im = _to_srgb(im)
     w, h = im.size
     s = min(w, h)
     im = im.crop(((w - s) // 2, (h - s) // 2, (w - s) // 2 + s, (h - s) // 2 + s))
+    if s > COVER_PX * 2:
+        im = im.resize((COVER_PX * 2, COVER_PX * 2), Image.LANCZOS)
     im = im.resize((COVER_PX, COVER_PX), Image.LANCZOS)
+    if sharpen:
+        im = im.filter(ImageFilter.UnsharpMask(radius=0.8, percent=70, threshold=2))
+    if saturation and abs(saturation - 1.0) > 0.01:
+        im = ImageEnhance.Color(im).enhance(saturation)
     raw = im.tobytes()
-    px = array.array("H", ((((raw[i] & 0xF8) << 8) | ((raw[i + 1] & 0xFC) << 3) | (raw[i + 2] >> 3))
-                           for i in range(0, len(raw), 3)))
+    # Real-world JPEGs keep 246-254 "mush" around big white (or black) fields; on the
+    # pod that mush is what triggers visible dither grain / tinted whites. Snap the
+    # neutral extremes before quantizing - the panel can only show 5/6/5 bits anyway.
+    raw = bytearray(raw)
+    for i in range(0, len(raw), 3):
+        r, g, b = raw[i], raw[i + 1], raw[i + 2]
+        if r >= 246 and g >= 246 and b >= 246:
+            raw[i] = raw[i + 1] = raw[i + 2] = 255
+        elif r <= 5 and g <= 5 and b <= 5:
+            raw[i] = raw[i + 1] = raw[i + 2] = 0
+    raw = bytes(raw)
+    if dither:
+        words = _rgb565_dithered(raw, COVER_PX, COVER_PX)
+    else:
+        words = [((round(raw[i] * 31 / 255) << 11) | (round(raw[i + 1] * 63 / 255) << 5)
+                  | round(raw[i + 2] * 31 / 255))
+                 for i in range(0, len(raw), 3)]
+    px = array.array("H", words)
     if sys.byteorder == "big":
         px.byteswap()
     header = b"MCOV" + struct.pack("<HHII", COVER_PX, COVER_PX, mp3_size & 0xFFFFFFFF, 0)
@@ -102,13 +176,14 @@ def make_cover_blob(cover_bytes, mp3_size):
 
 
 def blob_to_image(blob):
-    """For tests / preview of what the iPod will show."""
+    """For tests / preview of what the iPod will show. The 5/6/5 channel values are
+    expanded back with the exact per-level spacing (31 -> 255 is 8.225..., not <<3)."""
     from PIL import Image
     px = array.array("H")
     px.frombytes(blob[16:])
     out = bytearray()
     for v in px:
-        out += bytes(((v >> 11) << 3, ((v >> 5) & 63) << 2, (v & 31) << 3))
+        out += bytes(((v >> 11) * 255 // 31, ((v >> 5) & 63) * 255 // 63, (v & 31) * 255 // 31))
     return Image.frombytes("RGB", (COVER_PX, COVER_PX), bytes(out))
 
 

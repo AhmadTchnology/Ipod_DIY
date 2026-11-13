@@ -9,6 +9,11 @@
 #define SCR_H 320
 #define TFT_ROT 0            // 0 or 2. Use 2 if the picture is upside down.
 
+// Gamma fix: 0 = stock behaviour, 1 = fix reported for this board
+// (GAMSET curve 2, then curve 1), 2 = full ST7789-style gamma tables
+// (fallback for panels where 1 has no effect).
+#define TFT_GAMMA_FIX 1
+
 // ---- Fixed by the CYD PCB ----
 #define PIN_BL   21          // backlight (PWM)
 #define T_CLK    25          // XPT2046 touch, bit-banged (own pins)

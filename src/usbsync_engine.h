@@ -322,9 +322,9 @@ class Engine {
         path[len] = 0;
         if (!validPath(path, "/music/", ".mp3")) { fail(cmd, E_PATH, "path not allowed"); break; }
         if (!SD.exists(path)) { fail(cmd, E_PATH, "no such file"); break; }
-        SD.remove(path);
+        if (!SD.remove(path)) { fail(cmd, E_SD, "delete failed (file busy on the card?)"); break; }
         char cp[40];
-        artCachePath(path, cp, sizeof(cp));
+        artCachePath(path, cp, sizeof(cp));   // cover removal is best effort: fine if it already went
         SD.remove(cp);
         libChanged();
         ack(cmd);

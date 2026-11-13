@@ -2,12 +2,12 @@
 Run:  python tests/test_roundtrip.py      (needs g++, pyserial not required)"""
 import os
 import random
-import select
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zlib
 
@@ -18,14 +18,41 @@ import mypod_media as M
 
 
 class PipeTransport:
+    """select.select() can't wait on pipes on Windows, so a daemon thread keeps the
+    child's stdout drained and read() waits on the buffer instead (works on all OSes)."""
     def __init__(self, proc):
         self.p = proc
         self.baud = 115200
+        self._buf = bytearray()
+        self._cv = threading.Condition()
+        self._eof = False
+        threading.Thread(target=self._pump, daemon=True).start()
+    def _pump(self):
+        fd = self.p.stdout.fileno()
+        while True:
+            try:
+                data = os.read(fd, 65536)
+            except OSError:
+                data = b""
+            with self._cv:
+                self._buf.extend(data)
+                self._eof = not data
+                self._cv.notify_all()
+                if not data:
+                    return
     def write(self, data):
         self.p.stdin.write(data); self.p.stdin.flush()
     def read(self, timeout):
-        r, _, _ = select.select([self.p.stdout], [], [], timeout)
-        return os.read(self.p.stdout.fileno(), 65536) if r else b""
+        deadline = time.time() + timeout
+        with self._cv:
+            while not self._buf and not self._eof:
+                left = deadline - time.time()
+                if left <= 0:
+                    return b""
+                self._cv.wait(min(left, 0.05))
+            out = bytes(self._buf)
+            self._buf.clear()
+            return out
     def set_baud(self, b):
         self.baud = b
     def flush_input(self):
@@ -221,6 +248,92 @@ def main():
         ok = True
     check(ok and not os.path.exists(os.path.join(mp, "Big One.mp3")) and not os.path.exists(os.path.join(mp, "Big One.mp3.tmp")), "cancel aborts cleanly, no partial file")
     shutil.rmtree(work, ignore_errors=True)
+
+    # --- cover quality: precise rounding, dithering, colour boost, force_covers
+    import io as _io
+    from PIL import Image as _PImg, ImageEnhance as _Enh
+
+    def _mean_sat_img(im):
+        tot = 0.0
+        for r, g, b in im.getdata():
+            mx, mn = max(r, g, b), min(r, g, b)
+            tot += 0.0 if mx == 0 else (mx - mn) / mx
+        return tot / 40000
+
+    white = _PImg.new("RGB", (400, 400), (255, 255, 255))
+    wb = _io.BytesIO(); white.save(wb, "PNG")
+    bw = M.make_cover_blob(wb.getvalue(), 0, saturation=1.0, sharpen=False)
+    v0 = struct.unpack("<H", bw[16:18])[0]
+    check(v0 == 65535, f"pure white rounds to 0xFFFF (got {v0:#06x})")
+
+    strip = _PImg.new("L", (400, 1))
+    for x in range(400):
+        strip.putpixel((x, 0), (x * 255) // 399)
+    ramp = strip.resize((400, 400), _PImg.NEAREST).convert("RGB")
+    rb = _io.BytesIO(); ramp.save(rb, "PNG")
+
+    def _ramp_err(blob):
+        px = struct.unpack("<40000H", blob[16:])
+        err = 0.0
+        for by in range(50):
+            for bx in range(50):
+                ideal = sum((8 * bx + xx) * 255 / 399.0 for xx in range(8)) / 8
+                got = 0.0
+                for yy in range(4):
+                    row = (4 * by + yy) * 200
+                    for xx in range(4):
+                        got += ((px[row + 4 * bx + xx] >> 5) & 63) * 255 / 63
+                err += abs(got / 16 - ideal)
+        return err
+    ed = _ramp_err(M.make_cover_blob(rb.getvalue(), 0, saturation=1.0, sharpen=False, dither=True))
+    en = _ramp_err(M.make_cover_blob(rb.getvalue(), 0, saturation=1.0, sharpen=False, dither=False))
+    check(ed < en, f"dithered grey ramp reconstructs closer to the true ramp ({ed:.2f} < {en:.2f})")
+
+    muted = _PImg.new("RGB", (400, 400), (170, 110, 110))
+    mb = _io.BytesIO(); muted.save(mb, "PNG")
+    base_im = _PImg.open(_io.BytesIO(mb.getvalue())).convert("RGB")
+    boost_im = _Enh.Color(base_im).enhance(1.25)
+    s0, s125 = _mean_sat_img(base_im), _mean_sat_img(boost_im)
+    check(s125 > 1.15 * s0,
+          f"colour boost 1.25 raises saturation >15% ({s125:.3f} vs {s0:.3f})")
+    b0 = _mean_sat_img(M.blob_to_image(M.make_cover_blob(mb.getvalue(), 0, saturation=1.0, sharpen=False, dither=False)))
+    b1 = _mean_sat_img(M.blob_to_image(M.make_cover_blob(mb.getvalue(), 0, saturation=1.25, sharpen=False, dither=False)))
+    check(b1 > b0,
+          f"boosted cover stays more saturated through the RGB565 blob ({b1:.3f} > {b0:.3f})")
+
+    cov = os.path.join(root, M.cover_dev_path("/music/Band - Song.mp3").lstrip("/"))
+    cur_size = next(s["size"] for s in dev.list_songs() if s["path"] == "/music/Band - Song.mp3")
+    work2 = tempfile.mkdtemp(prefix="mypod_cov_")            # the earlier work dir was already cleaned up
+    ta_re = {"path": os.path.join(work2, "a.mp3"), "name": "Band - Song",
+             "info": {"cover": jb.getvalue()}}               # same name + size as the one on the card
+    open(ta_re["path"], "wb").write(b"A" * cur_size)
+    mtime0 = os.path.getmtime(cov)
+    r4 = B.run_batch(dev, [(0, ta_re)], False, True, lambda: False,
+                     lambda i, s: None, lambda *a: None, print)
+    check(r4 == (0, 1, 0), f"re-run without force_covers still skips the song: {r4}")
+    check(os.path.getmtime(cov) == mtime0, "existing cover file untouched without force_covers")
+    diff = _PImg.new("RGB", (300, 300), (10, 180, 60))
+    db = _io.BytesIO(); diff.save(db, "PNG")
+    taf = dict(ta_re, info={"cover": db.getvalue()})
+    before = open(cov, "rb").read()
+    r5 = B.run_batch(dev, [(0, taf)], False, True, lambda: False,
+                     lambda i, s: None, lambda *a: None, print, force_covers=True)
+    check(r5 == (0, 1, 0) and open(cov, "rb").read() != before,
+          f"force_covers skips the song, replaces only the cover: {r5}")
+    shutil.rmtree(work2, ignore_errors=True)
+
+    # --- near-white mush (typical JPEG artefact) snaps to clean white
+    pale = _PImg.new("RGB", (400, 400), (250, 250, 251))
+    nb = _io.BytesIO(); pale.save(nb, "PNG")
+    v1 = struct.unpack("<H", M.make_cover_blob(nb.getvalue(), 0, saturation=1.0, sharpen=False)[16:18])[0]
+    check(v1 == 65535, f"near-white JPEG background snaps to clean white (got {v1:#06x})")
+
+    # --- deleting a song that is not there must refuse, not ack a lie
+    try:
+        dev.delete("/music/no such song.mp3"); ok = False
+    except P.DeviceError as e:
+        ok = e.code == 2                                   # E_PATH
+    check(ok, "deleting a missing song reports an error instead of success")
 
     # --- exit
     dev.exit_to_player()

@@ -12,9 +12,13 @@ def human(n):
         n /= 1024
 
 
-def run_batch(dev, items, strip, skip_existing, cancel, on_row, on_progress, say):
+def run_batch(dev, items, strip, skip_existing, cancel, on_row, on_progress, say,
+              force_covers=False, saturation=1.25):
     """items: list of (index, track) with track = {path, name, info{cover,...}}.
-    Returns (sent, already_there, failed)."""
+    Returns (sent, already_there, failed).
+    force_covers: songs already on the iPod are still skipped, but their cover file
+    is re-sent (refresh old covers drawn with an older, duller conversion).
+    saturation: cover colour boost handed to make_cover_blob (1.0 = original)."""
     existing = {s["path"]: s for s in dev.list_songs()}
     used = set()
     total_bytes = sum(os.path.getsize(t["path"]) for _, t in items)
@@ -38,7 +42,7 @@ def run_batch(dev, items, strip, skip_existing, cancel, on_row, on_progress, say
             blob = None
             if t["info"].get("cover"):
                 try:
-                    blob = M.make_cover_blob(t["info"]["cover"], size)
+                    blob = M.make_cover_blob(t["info"]["cover"], size, saturation=saturation)
                 except Exception as e:
                     say(f"  cover of '{t['name']}' not readable ({e}) - sending without it")
             if skip_existing and same:
@@ -55,7 +59,7 @@ def run_batch(dev, items, strip, skip_existing, cancel, on_row, on_progress, say
                 dev.put(dpath, src, progress=prog, cancel=cancel)
                 sent += 1
                 status = "done"
-            if blob and not (skip_existing and same and old.get("cover")):
+            if blob and not (skip_existing and same and old.get("cover") and not force_covers):
                 dev.put(M.cover_dev_path(dpath), blob, cancel=cancel)
             on_row(idx, status)
         except P.Cancelled:
